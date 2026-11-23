@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-Security fixes will apply to the **latest published public release** once released on GitHub Releases (pre-release / local dev snapshots and unreleased `0.3.24` preview builds are unsupported):
+Security fixes apply to the **latest published public release** on GitHub Releases (pre-release / local dev snapshots are unsupported):
 
 | Version | Status | Supported |
 |---|---|---|
-| `0.3.24` | Upcoming initial public release candidate (currently unpublished preview) | Upon official `v0.3.24` release |
-| Older / local dev builds | Pre-public or development snapshots | No |
+| `0.3.24` | Latest public release (published 2026-11-23) | Yes |
+| Older / local dev builds | Pre-release or development snapshots | No |
 
 ## Reporting a Vulnerability
 
