@@ -1,0 +1,11 @@
+{
+  "recalldock-session": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "recalldock host-event antigravity --event SessionStart",
+        "timeout": 5
+      }
+    ]
+  }
+}

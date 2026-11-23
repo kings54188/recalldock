@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "description": "Synthetic bilingual lexical retrieval fixture v2: shared-vocabulary disambiguation, token-order variation, near-synonym overlap and a negative query. Lexical only; it does not measure semantic translation or host billing.",
+  "records": [
+    {"key": "wal-en", "title": "SQLite WAL consistent backup", "content": "Use an online SQLite snapshot to include committed WAL records; verify integrity before restore."},
+    {"key": "wal-zh", "title": "SQLite 在线备份与完整性", "content": "运行中的数据库使用在线快照，不直接复制主文件；恢复前核对完整性和来源。"},
+    {"key": "cas-en", "title": "Compare and swap revision guard", "content": "Explicit revision updates require the expected snapshot digest before overwrite."},
+    {"key": "cas-zh", "title": "比较并交换的版本守卫", "content": "显式修订必须带上期望快照摘要，避免静默覆盖已改变状态。"},
+    {"key": "rollback-en", "title": "Rollback keeps security policy", "content": "Restoring configuration must retain the hardened admission policy."},
+    {"key": "worktree-en", "title": "Linked worktree identity", "content": "An unbound worktree must not create a second project identity."},
+    {"key": "retention-en", "title": "Backup retention policy", "content": "Retention keeps old database copies for thirty days."}
+  ],
+  "queries": [
+    {"query": "consistent backup", "language": "en", "expected": ["wal-en"]},
+    {"query": "backup", "language": "en", "expected": ["wal-en", "retention-en"]},
+    {"query": "在线备份", "language": "zh", "expected": ["wal-zh"]},
+    {"query": "swap compare", "language": "en", "expected": ["cas-en"]},
+    {"query": "比较 交换", "language": "zh", "expected": ["cas-zh"]},
+    {"query": "rollback admission policy", "language": "en", "expected": ["rollback-en"]},
+    {"query": "worktree identity", "language": "en", "expected": ["worktree-en"]},
+    {"query": "zzzznotpresent", "language": "en", "expected": []}
+  ]
+}

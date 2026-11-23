@@ -1,0 +1,28 @@
+{
+  "format": 1,
+  "description": "Synthetic boolean retrieval v3: strict Chinese AND, complete mixed-word OR groups, standalone stopwords, raw BM25 and scoped single-edit suggestions. No semantic translation or host billing claims.",
+  "records": [
+    {"key": "kicker", "title": "Kicker 正方形 SVG", "content": "kicker uses SVG canvas sizing"},
+    {"key": "missing-cn", "title": "不存在的配置文件", "content": "不存在的文件需要显式提示"},
+    {"key": "xyz", "title": "URDF xyz origin", "content": "xyz coordinates define robot origin"},
+    {"key": "panel", "title": "面板配置", "content": "面板布局设置"},
+    {"key": "panel-icons", "title": "面板 图标", "content": "面板布局和图标尺寸"},
+    {"key": "cn-api", "title": "中文 API", "content": "中文 API reference"},
+    {"key": "cn-only", "title": "中文资料", "content": "Chinese-only reference"},
+    {"key": "api-only", "title": "API reference", "content": "API specification"}
+  ],
+  "queries": [
+    {"query": "不存在的词xyz", "language": "mixed", "expected": []},
+    {"query": "kicker 不存在的词xyz", "language": "mixed", "expected": []},
+    {"query": "kicker 不存在的词xyz", "match_mode": "any", "language": "mixed", "expected": ["kicker"]},
+    {"query": "kicker zzzqqq", "match_mode": "any", "language": "en", "expected": ["kicker"]},
+    {"query": "面板 图标", "language": "zh", "expected": ["panel-icons"]},
+    {"query": "kicker 面板 图标", "language": "mixed", "expected": []},
+    {"query": "kicker 的 了 是 在 不 和", "language": "mixed", "expected": ["kicker"]},
+    {"query": "中文API", "language": "mixed", "expected": ["cn-api"]},
+    {"query": "中文API", "match_mode": "any", "language": "mixed", "expected": ["cn-api"]},
+    {"query": "中文kiker", "match_mode": "any", "language": "mixed", "expected": [], "no_suggestion": true},
+    {"query": "kiker", "language": "en", "expected": [], "suggested_query": "kicker", "suggested_key": "kicker"},
+    {"query": "xyz", "language": "en", "expected": ["xyz"]}
+  ]
+}

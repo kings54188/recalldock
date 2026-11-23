@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "recalldock": {
+      "command": "recalldock",
+      "args": ["mcp", "--tools=agent"]
+    }
+  }
+}

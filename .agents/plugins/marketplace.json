@@ -1,0 +1,19 @@
+{
+  "name": "recalldock-local",
+  "interface": {
+    "displayName": "RecallDock Local"
+  },
+  "plugins": [
+    {
+      "name": "recalldock",
+      "source": {
+        "source": "local",
+        "path": "./integrations/host-plugins/plugins/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

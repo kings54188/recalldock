@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "recalldock": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "exec \"$HOME/.local/bin/recalldock\" gateway serve --host codex"
+      ]
+    }
+  }
+}

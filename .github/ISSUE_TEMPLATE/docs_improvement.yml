@@ -1,0 +1,16 @@
+name: Documentation Improvement
+description: Fix inaccurate, unclear, or outdated RecallDock documentation
+labels: ["documentation"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Documentation File / Section
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Suggested Improvement
+    validations:
+      required: true

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "recalldock": {
+      "command": "recalldock",
+      "args": ["gateway", "serve", "--host", "antigravity"]
+    }
+  }
+}

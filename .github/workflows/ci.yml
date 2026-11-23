@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tests:
+    name: Linux Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+
+      - name: Run unit tests
+        run: go test -count=1 ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run race detector on core packages
+        run: go test -race -timeout=20m -count=1 ./internal/opsstore ./internal/gateway ./internal/store ./internal/mcp ./internal/server ./internal/project ./cmd/recalldock
+
+      - name: Run HTTP E2E tests
+        run: go test -count=1 -tags e2e ./internal/server/...
+
+      - name: Run Python installer unit tests
+        run: |
+          python3 -I -B tools/test_install_local.py
+          python3 -I -B tools/test_gateway_migrate.py
+          python3 -I -B tools/test_release.py
+
+      - name: Verify public export manifest & leak checks
+        run: python3 -I -B tools/export-public.py --check --target .
+
+  windows-tests:
+    name: Windows x64 Tests & Package Verification
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run go vet (Windows)
+        run: go vet ./...
+
+      - name: Run unit tests (Windows)
+        run: go test -count=1 ./...
+
+      - name: Run HTTP E2E tests (Windows)
+        run: go test -count=1 -tags e2e ./internal/server/...
+
+      - name: Run release identity regressions (Windows)
+        run: python -I -B tools/test_release.py
+
+      - name: Build Windows x64 ZIP package
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "recalldock-win-build"
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}".StartsWith("v")) {
+            $ver = "${{ github.ref_name }}".Substring(1)
+            python -I -B tools/build-release-windows.py --version $ver --publish-local --output $out
+          } else {
+            $ver = "0.3.24-dev.${{ github.run_number }}"
+            python -I -B tools/build-release-windows.py --version $ver --development --output $out
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Windows package build failed" }
+          $verifyArgs = @("-I", "-B", "tools/verify-release.py", "--version", $ver, "--source-commit", (git rev-parse HEAD), "--windows", $out, "--report", (Join-Path $out "package-verification.json"))
+          if ($ver.Contains("-")) {
+            $verifyArgs += "--development"
+          } else {
+            $verifyArgs += @("--tag-object", (git rev-parse "refs/tags/v$ver"))
+          }
+          python @verifyArgs
+          if ($LASTEXITCODE -ne 0) { throw "Windows package identity or integrity failed" }
+
+      - name: Run 14-point Windows package verification
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "recalldock-win-build"
+          $zip = Get-ChildItem -Path $out -Filter "recalldock_*_windows_amd64.zip" | Select-Object -First 1
+          python -I -B tools/verify-windows.py --zip $zip.FullName --checksums (Join-Path $out "checksums.txt") --report (Join-Path $out "windows-verification.json")
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows verification failed" }
+
+      - name: Upload Windows verified package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: recalldock-windows-amd64
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/recalldock-win-build/*.zip
+            ${{ runner.temp }}/recalldock-win-build/checksums.txt
+            ${{ runner.temp }}/recalldock-win-build/build.json
+            ${{ runner.temp }}/recalldock-win-build/package-verification.json
+            ${{ runner.temp }}/recalldock-win-build/windows-verification.json

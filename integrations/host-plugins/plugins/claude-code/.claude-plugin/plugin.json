@@ -1,0 +1,8 @@
+{
+  "name": "recalldock",
+  "version": "0.1.0",
+  "description": "Local selective memory and bounded recovery, without automatic conversation capture.",
+  "author": {
+    "name": "RecallDock Local"
+  }
+}

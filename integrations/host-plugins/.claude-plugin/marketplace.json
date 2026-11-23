@@ -1,0 +1,14 @@
+{
+  "name": "recalldock-local",
+  "owner": {
+    "name": "RecallDock Local"
+  },
+  "plugins": [
+    {
+      "name": "recalldock",
+      "description": "Local selective memory adapter",
+      "version": "0.1.0",
+      "source": "./plugins/claude-code"
+    }
+  ]
+}

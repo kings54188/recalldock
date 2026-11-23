@@ -1,0 +1,38 @@
+name: Bug Report
+description: Report a bug in RecallDock
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug in RecallDock! Please include your version, OS, and exact reproduction steps.
+  - type: input
+    id: version
+    attributes:
+      label: RecallDock Version
+      placeholder: "e.g. 0.3.24 (from `recalldock version`)"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating System
+      options:
+        - Linux (x86_64)
+        - Windows (x64 native)
+        - Other (please specify)
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce & error output
+      description: Do not paste secrets, tokens, private paths, or full personal databases.
+    validations:
+      required: true

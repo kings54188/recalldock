@@ -1,0 +1,195 @@
+name: RecallDock Release Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact final version without v; requires an existing annotated tag
+        required: true
+        type: string
+      publish:
+        description: Create a draft GitHub Release on THIS repository after verification
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          fetch-depth: 0
+      - name: Resolve and validate annotated source tag
+        id: source
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ref="refs/tags/v$RELEASE_VERSION"
+          commit=$(git rev-parse "$ref^{commit}")
+          tag_object=$(git rev-parse "$ref")
+          python3 -I -B tools/verify-release.py --source-only --version "$RELEASE_VERSION" --source-commit "$commit" --tag-object "$tag_object"
+          printf 'source_commit=%s\ntag_object=%s\n' "$commit" "$tag_object" >> "$GITHUB_OUTPUT"
+
+  package-linux:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ needs.resolve-tag.outputs.source_commit }}
+      TAG_OBJECT: ${{ needs.resolve-tag.outputs.tag_object }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-tag.outputs.source_commit }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+      - name: Validate pinned Linux source and core
+        run: |
+          set -euo pipefail
+          python3 -I -B tools/verify-release.py --source-only --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT"
+          python3 -I -B tools/export-public.py --check --target .
+          go test -count=1 ./...
+          go vet ./...
+          python3 -I -B tools/test_release.py
+          python3 -I -B tools/test_gateway_migrate.py
+          python3 -I -B tools/test_install_local.py
+      - name: Build and verify immutable Linux package
+        run: |
+          set -euo pipefail
+          python3 -I -B tools/build-release.py --version "$RELEASE_VERSION" --publish-local --output "$RUNNER_TEMP/recalldock-linux"
+          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux "$RUNNER_TEMP/recalldock-linux" --report "$RUNNER_TEMP/recalldock-linux/package-verification.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recalldock-linux-amd64
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/recalldock-linux/*.tar.gz
+            ${{ runner.temp }}/recalldock-linux/checksums.txt
+            ${{ runner.temp }}/recalldock-linux/build.json
+            ${{ runner.temp }}/recalldock-linux/package-verification.json
+
+  package-windows:
+    needs: resolve-tag
+    runs-on: windows-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ needs.resolve-tag.outputs.source_commit }}
+      TAG_OBJECT: ${{ needs.resolve-tag.outputs.tag_object }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-tag.outputs.source_commit }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate pinned Windows source and core
+        shell: pwsh
+        run: |
+          python -I -B tools/verify-release.py --source-only --version $env:RELEASE_VERSION --source-commit $env:SOURCE_COMMIT --tag-object $env:TAG_OBJECT
+          if ($LASTEXITCODE -ne 0) { throw "Source tag verification failed" }
+          python -I -B tools/export-public.py --check --target .
+          if ($LASTEXITCODE -ne 0) { throw "Public export audit failed" }
+          python -I -B tools/test_release.py
+          if ($LASTEXITCODE -ne 0) { throw "Release regressions failed" }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
+          go test -count=1 ./...
+          if ($LASTEXITCODE -ne 0) { throw "Go tests failed" }
+      - name: Build and verify Windows ZIP
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "recalldock-windows"
+          python -I -B tools/build-release-windows.py --version $env:RELEASE_VERSION --publish-local --output $out
+          if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
+          python -I -B tools/verify-release.py --version $env:RELEASE_VERSION --source-commit $env:SOURCE_COMMIT --tag-object $env:TAG_OBJECT --windows $out --report (Join-Path $out "package-verification.json")
+          if ($LASTEXITCODE -ne 0) { throw "Windows package integrity failed" }
+          $zip = Join-Path $out "recalldock_$($env:RELEASE_VERSION)_windows_amd64.zip"
+          python -I -B tools/verify-windows.py --zip $zip --checksums (Join-Path $out "checksums.txt") --report (Join-Path $out "windows-verification.json")
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows verification failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recalldock-windows-amd64
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/recalldock-windows/*.zip
+            ${{ runner.temp }}/recalldock-windows/checksums.txt
+            ${{ runner.temp }}/recalldock-windows/build.json
+            ${{ runner.temp }}/recalldock-windows/package-verification.json
+            ${{ runner.temp }}/recalldock-windows/windows-verification.json
+
+  verify-packages:
+    needs: [resolve-tag, package-linux, package-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-tag.outputs.source_commit }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: recalldock-*-amd64
+          path: artifacts
+      - name: Verify both packages against the same annotated tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve-tag.outputs.source_commit }}
+          TAG_OBJECT: ${{ needs.resolve-tag.outputs.tag_object }}
+        run: |
+          set -euo pipefail
+          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux artifacts/recalldock-linux-amd64 --windows artifacts/recalldock-windows-amd64 --checksums-output checksums.txt --report release-verification.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recalldock-release-verification
+          if-no-files-found: error
+          path: |
+            checksums.txt
+            release-verification.json
+
+  publish-draft:
+    needs: [resolve-tag, verify-packages]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-tag.outputs.source_commit }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Recheck integrity and create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve-tag.outputs.source_commit }}
+          TAG_OBJECT: ${{ needs.resolve-tag.outputs.tag_object }}
+        run: |
+          set -euo pipefail
+          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux artifacts/recalldock-linux-amd64 --windows artifacts/recalldock-windows-amd64 --checksums-output checksums.txt --report release-verification.json
+          cp artifacts/recalldock-linux-amd64/build.json build-linux.json
+          cp artifacts/recalldock-windows-amd64/build.json build-windows.json
+          gh release create "v$RELEASE_VERSION" \
+            "artifacts/recalldock-linux-amd64/recalldock_${RELEASE_VERSION}_linux_amd64.tar.gz" \
+            "artifacts/recalldock-windows-amd64/recalldock_${RELEASE_VERSION}_windows_amd64.zip" \
+            build-linux.json build-windows.json \
+            artifacts/recalldock-windows-amd64/windows-verification.json \
+            checksums.txt release-verification.json \
+            --verify-tag --draft --title "RecallDock $RELEASE_VERSION" --notes-file docs/RELEASE.md

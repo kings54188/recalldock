@@ -1,0 +1,38 @@
+{
+  "format": 1,
+  "description": "Synthetic deterministic lexical retrieval and lifecycle corpus; no semantic translation claims.",
+  "records": [
+    {"key":"wal-en","title":"SQLite WAL consistent backup","content":"Use an online SQLite snapshot to include committed WAL records; verify integrity before restore."},
+    {"key":"wal-zh","title":"SQLite 在线备份与完整性","content":"运行中的数据库使用在线快照，不直接复制主文件；恢复前核对完整性和来源。"},
+    {"key":"cas-en","title":"Optimistic compare and swap editing","content":"Reject a stale snapshot digest before replacing a durable fact. Read the current revision before retrying."},
+    {"key":"cas-zh","title":"旧快照修改拒绝覆盖","content":"编辑知识时核对当前摘要；旧快照不能覆盖较新的修订，重新读取后再决定。"},
+    {"key":"identity-en","title":"Directory inode binding identity","content":"Copied markers cannot establish ownership. Explicitly rebind a moved directory to its stable project identity."},
+    {"key":"identity-zh","title":"项目同名目录身份隔离","content":"目录同名不代表相同项目；移动或复制后显式重新绑定，不能靠名字猜测历史。"},
+    {"key":"archive-en","title":"Archive reversible knowledge lifecycle","content":"Archive preserves the body and revision history while excluding the memory from default retrieval. Explicit reactivation restores eligibility."},
+    {"key":"archive-zh","title":"归档保留知识与修订历史","content":"归档不删除正文，默认召回排除已归档条目；核对证据后显式重新激活。"},
+    {"key":"gateway-en","title":"Gateway lease execution fingerprint","content":"An execution lease binds a schema fingerprint, project root and approved argument digest; configuration changes expire old rights."},
+    {"key":"gateway-zh","title":"网关默认拒绝与精确许可","content":"目录查询不启动后端；核对工具参数、目录和到期时间后由操作人授予精确许可。"},
+    {"key":"progress-en","title":"Progress independent operations database","content":"Task checkpoints belong to the bounded operations database. They do not become durable knowledge facts."},
+    {"key":"progress-zh","title":"工作账本不是长期知识","content":"普通进度写入精确项目根目录与任务线的工作账本，不把完整对话、猜测或日志当作长期事实。"},
+    {"key":"distractor-en","title":"WAL shipping replication policy","content":"Replication transport is disabled in the local-only runtime. Online upload is not an installation requirement."},
+    {"key":"distractor-zh","title":"用户手改 Markdown 投影","content":"导出遇到用户手改正文时保留现有文件并报告冲突，不静默覆盖。"},
+    {"key":"retired","title":"Retired obsolete protocol","content":"retired-exclusive-marker is obsolete and must be absent from active retrieval.","archive":true}
+  ],
+  "queries": [
+    {"query":"consistent backup","language":"en","expected":["wal-en"]},
+    {"query":"在线备份","language":"zh","expected":["wal-zh"]},
+    {"query":"compare and swap","language":"en","expected":["cas-en"]},
+    {"query":"旧快照修改","language":"zh","expected":["cas-zh"]},
+    {"query":"inode binding","language":"en","expected":["identity-en"]},
+    {"query":"同名目录","language":"zh","expected":["identity-zh"]},
+    {"query":"reversible knowledge","language":"en","expected":["archive-en"]},
+    {"query":"归档保留","language":"zh","expected":["archive-zh"]},
+    {"query":"lease execution","language":"en","expected":["gateway-en"]},
+    {"query":"默认拒绝","language":"zh","expected":["gateway-zh"]},
+    {"query":"independent operations","language":"en","expected":["progress-en"]},
+    {"query":"工作账本","language":"zh","expected":["progress-zh"]},
+    {"query":"absent-superconducting-marker","language":"en","expected":[]},
+    {"query":"不存在的量子纠错材料","language":"zh","expected":[]},
+    {"query":"retired-exclusive-marker","language":"en","expected":[]}
+  ]
+}
