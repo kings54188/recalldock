@@ -44,7 +44,7 @@ By default on native Windows, RecallDock keeps its binary, databases, and host c
 
 ## Guided Interactive Install (Recommended)
 
-> **Release Status**: `0.3.24` is the upcoming initial public release (download links activate once `v0.3.24` is tagged and published on GitHub Releases).
+> **Release Status**: `0.3.24` is the current public release; download the packages below from GitHub Releases.
 
 1. Download `recalldock_0.3.24_windows_amd64.zip` and `checksums.txt` from [GitHub Releases](https://github.com/kings54188/recalldock/releases).
 2. Verify SHA256 against `checksums.txt` in PowerShell:

@@ -51,9 +51,9 @@ See [docs/HOST-ADAPTERS.md](docs/HOST-ADAPTERS.md) for details on what each host
 
 ## Download & Quick Install
 
-> **Release Status**: `0.3.24` is the upcoming initial public release (currently in pre-public preview; GitHub Releases packages become downloadable once `v0.3.24` is formally tagged and published). Until then, you can also build directly from source below.
+> **Release Status**: `0.3.24` is the current public release. Prebuilt Linux and Windows packages are available from [GitHub Releases](https://github.com/kings54188/recalldock/releases/tag/v0.3.24); you can also build directly from source below.
 
-Once `v0.3.24` is published, download the release archive for your OS and `checksums.txt` from [GitHub Releases](https://github.com/kings54188/recalldock/releases).
+Download the release archive for your OS and `checksums.txt` from [GitHub Releases](https://github.com/kings54188/recalldock/releases).
 
 ### Linux (`x86_64` / `amd64`)
 

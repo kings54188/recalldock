@@ -60,8 +60,8 @@ The local development commit and the public snapshot commit have different Git i
 
 `.github/workflows/release.yml` has only `workflow_dispatch`; pushes and tags do not publish releases. The `publish` input defaults to `false`. The workflow never creates tags, changes repository visibility, or publishes a non-draft Release.
 
-1. Obtain explicit operator approval for the exact source mapping, target repository, annotated tag, public visibility, and formal publication. Preserve the stable `v0.3.23` tag and installed runtime.
-2. After approval, create the annotated `v0.3.24` tag on the verified public snapshot commit (and record the corresponding local source commit). Dispatch the workflow on that tag with `version=0.3.24`.
+1. Obtain explicit operator approval for the exact source mapping, target repository, annotated tag, public visibility, and formal publication. Preserve the previously published `v0.3.24` tag and installed runtime as the stable baseline for the next release.
+2. After approval, create the annotated `vX.Y.Z` tag on the verified public snapshot commit (and record the corresponding local source commit). Dispatch the workflow on that tag with `version=X.Y.Z`.
 3. The resolver verifies the annotated tag and captures its commit and tag-object SHA once. Both platform jobs check out that pinned commit, validate that the tag has not changed, and build with `--publish-local`.
 4. Linux runs core/installer tests and isolated installation, retrieval, project-boundary, Gateway, Work, admission and host-adapter checks. Windows runs native core tests and the isolated Windows ZIP verification, including PowerShell install/rollback and database preservation.
 5. Both platform jobs verify their own manifests and checksums. An independent job downloads both archives, checks their shared source/version/tag identity, and emits the combined checksums and verification report. Any failure prevents the draft job from running. Windows explicitly stops on each failed external command.

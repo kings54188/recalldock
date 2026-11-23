@@ -51,9 +51,9 @@ RecallDock 用一个单二进制程序配合两个独立 SQLite 数据库在本�
 
 ## 下载与快速安装
 
-> **发布状态说明**：`0.3.24` 为即将公开的首个公开发行版本（当前处于公开发布前私有预览审阅阶段，待正式打 `v0.3.24` tag 并发布 Release 后即可直接从 GitHub Releases 下载安装包）。目前也可以按下方步骤从源码直接编译使用。
+> **发布状态说明**：`0.3.24` 为当前正式公开发行版本，Linux 与 Windows 预编译安装包已发布于 [GitHub Releases](https://github.com/kings54188/recalldock/releases/tag/v0.3.24)；也可以按下方步骤从源码直接编译使用。
 
-正式发布后，可前往 [GitHub Releases](https://github.com/kings54188/recalldock/releases) 下载对应平台安装包及 `checksums.txt`。
+前往 [GitHub Releases](https://github.com/kings54188/recalldock/releases) 下载对应平台安装包及 `checksums.txt`。
 
 ### Linux (`x86_64` / `amd64`)
 

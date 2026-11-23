@@ -6,7 +6,7 @@ This guide covers standard Linux (`x86_64` / `amd64`) user-level installation wi
 
 ## 1. Verify & Unpack the Release
 
-> **Release Status**: `0.3.24` is the upcoming initial public release (download links activate once `v0.3.24` is tagged and published on GitHub Releases).
+> **Release Status**: `0.3.24` is the current public release; download the packages below from GitHub Releases.
 
 1. Download `recalldock_0.3.24_linux_amd64.tar.gz` and `checksums.txt` from [GitHub Releases](https://github.com/kings54188/recalldock/releases).
 2. Verify the archive hash:

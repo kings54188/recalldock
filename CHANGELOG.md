@@ -4,7 +4,7 @@
 
 版本以 annotated tag 与不可变平台包（Linux x64 `.tar.gz` 与 Windows x64 `.zip`）交付：每个正式版本从干净提交构建，包内附 `release.json` 与 SHA256 校验；安装、备份与回滚说明见 [docs/INSTALLATION.md](docs/INSTALLATION.md)、[docs/WINDOWS.md](docs/WINDOWS.md) 与 [docs/RELEASE.md](docs/RELEASE.md)。破坏性变更在对应版本条目中显式标注迁移路径。
 
-## 0.3.24 — 2026-11-22（首次公开发行候选 + 原生 Windows x64 支持）
+## 0.3.24 — 2026-11-23（首个正式公开发行版本 + 原生 Windows x64 支持）
 
 - **feat(windows):** 新增原生 Windows x64 (`windows/amd64`) 支持（纯 Go 零 CGO，无需 WSL2 或管理员权限）：默认数据目录 `%LOCALAPPDATA%\RecallDock`（与 WSL2 `~/.recalldock` 隔离）、Windows 卷序列号/文件索引目录身份与 reparse-point 防护 (`directory_identity_windows.go`、`identity_windows.go`、`candidate_file_open_windows.go`)、Windows 8.3 短路径规范化 (`NormalizeWindowsShortPath`、`expandOpsShortPath`)、进程组隔离 (`process_windows.go`)、独占锁项目识别 (`host_project_windows.go`)、路径大小写不敏感与 UNC 路径拒绝、PowerShell 交互/无交互安装与受保护回滚 (`tools/install-windows.ps1`)、Windows ZIP 打包 (`tools/build-release-windows.py`) 及 Windows 验证脚本 (`tools/verify-windows.py`)。
 - **feat(gateway/install):** 新增只读 `recalldock gateway scan`（区分 `host_direct` / `gateway_managed` / `both`，绝不读取/回显密钥且不静默接管）、`gateway add` 直接命令行参数（保留 `--input`）与移除后端时的 live lease 及时关闭；Linux `install-local.py` 与 Windows `install-windows.ps1` 增加引导式 `--interactive` / `-Interactive` 安装并保留摘要 CAS 与受保护回滚。
