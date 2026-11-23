@@ -143,7 +143,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: recalldock-*-amd64
-          path: artifacts
+          path: ${{ runner.temp }}/artifacts
       - name: Verify both packages against the same annotated tag
         env:
           RELEASE_VERSION: ${{ inputs.version }}
@@ -151,14 +151,14 @@ jobs:
           TAG_OBJECT: ${{ needs.resolve-tag.outputs.tag_object }}
         run: |
           set -euo pipefail
-          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux artifacts/recalldock-linux-amd64 --windows artifacts/recalldock-windows-amd64 --checksums-output checksums.txt --report release-verification.json
+          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux "$RUNNER_TEMP/artifacts/recalldock-linux-amd64" --windows "$RUNNER_TEMP/artifacts/recalldock-windows-amd64" --checksums-output "$RUNNER_TEMP/checksums.txt" --report "$RUNNER_TEMP/release-verification.json"
       - uses: actions/upload-artifact@v4
         with:
           name: recalldock-release-verification
           if-no-files-found: error
           path: |
-            checksums.txt
-            release-verification.json
+            ${{ runner.temp }}/checksums.txt
+            ${{ runner.temp }}/release-verification.json
 
   publish-draft:
     needs: [resolve-tag, verify-packages]
@@ -173,7 +173,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: ${{ runner.temp }}/artifacts
       - name: Recheck integrity and create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -183,13 +183,13 @@ jobs:
           TAG_OBJECT: ${{ needs.resolve-tag.outputs.tag_object }}
         run: |
           set -euo pipefail
-          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux artifacts/recalldock-linux-amd64 --windows artifacts/recalldock-windows-amd64 --checksums-output checksums.txt --report release-verification.json
-          cp artifacts/recalldock-linux-amd64/build.json build-linux.json
-          cp artifacts/recalldock-windows-amd64/build.json build-windows.json
+          python3 -I -B tools/verify-release.py --version "$RELEASE_VERSION" --source-commit "$SOURCE_COMMIT" --tag-object "$TAG_OBJECT" --linux "$RUNNER_TEMP/artifacts/recalldock-linux-amd64" --windows "$RUNNER_TEMP/artifacts/recalldock-windows-amd64" --checksums-output "$RUNNER_TEMP/checksums.txt" --report "$RUNNER_TEMP/release-verification.json"
+          cp "$RUNNER_TEMP/artifacts/recalldock-linux-amd64/build.json" "$RUNNER_TEMP/build-linux.json"
+          cp "$RUNNER_TEMP/artifacts/recalldock-windows-amd64/build.json" "$RUNNER_TEMP/build-windows.json"
           gh release create "v$RELEASE_VERSION" \
-            "artifacts/recalldock-linux-amd64/recalldock_${RELEASE_VERSION}_linux_amd64.tar.gz" \
-            "artifacts/recalldock-windows-amd64/recalldock_${RELEASE_VERSION}_windows_amd64.zip" \
-            build-linux.json build-windows.json \
-            artifacts/recalldock-windows-amd64/windows-verification.json \
-            checksums.txt release-verification.json \
+            "$RUNNER_TEMP/artifacts/recalldock-linux-amd64/recalldock_${RELEASE_VERSION}_linux_amd64.tar.gz" \
+            "$RUNNER_TEMP/artifacts/recalldock-windows-amd64/recalldock_${RELEASE_VERSION}_windows_amd64.zip" \
+            "$RUNNER_TEMP/build-linux.json" "$RUNNER_TEMP/build-windows.json" \
+            "$RUNNER_TEMP/artifacts/recalldock-windows-amd64/windows-verification.json" \
+            "$RUNNER_TEMP/checksums.txt" "$RUNNER_TEMP/release-verification.json" \
             --verify-tag --draft --title "RecallDock $RELEASE_VERSION" --notes-file docs/RELEASE.md

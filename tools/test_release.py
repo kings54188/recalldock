@@ -26,6 +26,18 @@ def load(name):
 
 
 class ReleaseTest(unittest.TestCase):
+    def test_release_workflow_keeps_downloads_and_outputs_outside_source_checkout(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        for job in ('verify-packages', 'publish-draft'):
+            block = workflow.split('  ' + job + ':\n', 1)[1].split('\n  publish-draft:', 1)[0]
+            with self.subTest(job=job):
+                self.assertIn('path: ${{ runner.temp }}/artifacts', block)
+                self.assertIn('--linux "$RUNNER_TEMP/artifacts/recalldock-linux-amd64"', block)
+                self.assertIn('--windows "$RUNNER_TEMP/artifacts/recalldock-windows-amd64"', block)
+                self.assertIn('--checksums-output "$RUNNER_TEMP/checksums.txt" --report "$RUNNER_TEMP/release-verification.json"', block)
+                self.assertNotIn('cp artifacts/', block)
+        self.assertIn('"$RUNNER_TEMP/build-linux.json" "$RUNNER_TEMP/build-windows.json"', workflow)
+
     def test_builders_reject_unverified_or_mislabeled_versions_before_building(self):
         for script in ('build-release', 'build-release-windows'):
             builder = load(script)
