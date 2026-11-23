@@ -178,29 +178,23 @@ recalldock gateway list
 
 ## 代码签名策略（Code signing policy）
 
-RecallDock 计划在满足该计划的声誉要求后，将 Windows 正式构建提交免费代码签名。**截至 `0.3.24`，Windows 构建尚未签名** —— 见上方未签名程序提示。
+**RecallDock 不对 Windows 二进制进行代码签名。** 正式包以未签名形式分发，本项目未持有、目前也不申请代码签名证书或证书机构签名安排。
 
-### 签名计划
+### 这意味着什么
 
-RecallDock 计划为其 Windows 正式构建使用免费代码签名。待申请获批并发布首个带签名的版本后，安排为：
+- 首次运行时 Windows 会显示发布者未知，SmartScreen 可能给出警告。这是未签名程序的正常表现，不代表文件被篡改。
+- 完整性由 SHA256 保证，而不是签名。每个 Release 页面都会发布 `checksums.txt`，运行前务必对照校验：
+  ```powershell
+  $zip = "recalldock_0.3.24_windows_amd64.zip"
+  $actual = (Get-FileHash .\$zip -Algorithm SHA256).Hash.ToLower()
+  $expected = ((Select-String -Path .\checksums.txt -Pattern "\b$([regex]::Escape($zip))$").Line -split '\s+')[0].ToLower()
+  if ($actual -eq $expected) { "OK: SHA256 校验通过 ($actual)" } else { throw "SHA256 不匹配: $actual != $expected" }
+  ```
+- Linux 包同样未签名，用同一份 `checksums.txt` 校验。
 
-> Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)。
+切勿为了跳过警告而全局关闭 Defender 或 SmartScreen。只从 [GitHub Releases](https://github.com/kings54188/recalldock/releases) 下载、校验哈希；如果不想用预编译二进制，也可以直接从源码编译。
 
-**该安排目前尚未生效。** 迄今为止没有任何 RecallDock 二进制被签名，本提示只在真正发布带签名版本之后，才会替换为无条件的正式说明。在此之前，请按上文说明用 `checksums.txt` 校验下载。
-
-### 角色
-
-| 角色 | 职责 | 成员 |
-|---|---|---|
-| Author（作者） | 有权无需额外审核直接修改源码 | [@kings54188](https://github.com/kings54188) |
-| Reviewer（审核者） | 审核非提交者提出的每一项变更 | [@kings54188](https://github.com/kings54188) |
-| Approver（批准者） | 逐个批准每次签名请求 | [@kings54188](https://github.com/kings54188) |
-
-RecallDock 目前由单人维护，因此三个角色由同一人担任。此处如实披露，不把它包装成并不存在的职责分离。
-
-### 签名的产物
-
-若签名申请获批，仅提交由 GitHub Actions 发布流水线从已打 tag 的提交构建出的 Windows 正式包（`recalldock_<version>_windows_amd64.zip`）。本地构建或第三方构建的二进制永远不会被签名。
+需要说明的是：`checksums.txt` 与安装包放在同一个位置，因此它只能证明文件没有损坏或传输错误，**不能证明是谁构建了这个包**。若你需要可独立验证的溯源链，请自行从已打 tag 的提交构建。
 
 ### 隐私
 

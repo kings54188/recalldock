@@ -178,29 +178,23 @@ Adding or removing a server in `gateway.json` takes effect live on `tools_find` 
 
 ## Code Signing Policy
 
-RecallDock intends to submit its Windows release builds for free code signing once the project meets the programme's reputation criteria. **As of `0.3.24`, Windows builds are not yet signed** — see the unsigned-binary notice above.
+**RecallDock does not sign its Windows binaries.** Release packages are distributed unsigned, and the project does not hold, and is not currently seeking, a code signing certificate or a certificate-authority signing arrangement.
 
-### Signing programme
+### What this means in practice
 
-RecallDock has applied-toward / intends to use free code signing for its Windows release builds. Once an application is approved and the first signed release ships, the arrangement will be:
+- Windows will show the publisher as unknown on first launch, and SmartScreen may warn. This is expected behaviour for an unsigned binary, not a sign of tampering.
+- Integrity is guaranteed by SHA256 instead of a signature. Every release page publishes `checksums.txt`; verify your download against it before running anything:
+  ```powershell
+  $zip = "recalldock_0.3.24_windows_amd64.zip"
+  $actual = (Get-FileHash .\$zip -Algorithm SHA256).Hash.ToLower()
+  $expected = ((Select-String -Path .\checksums.txt -Pattern "\b$([regex]::Escape($zip))$").Line -split '\s+')[0].ToLower()
+  if ($actual -eq $expected) { "OK: SHA256 matches ($actual)" } else { throw "SHA256 mismatch: $actual != $expected" }
+  ```
+- The Linux packages are likewise unsigned; compare them against the same `checksums.txt`.
 
-> Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+Do not disable Defender or SmartScreen globally to get past the warning. Download only from [GitHub Releases](https://github.com/kings54188/recalldock/releases), verify the hash, and build from source if you prefer to avoid prebuilt binaries entirely.
 
-**That arrangement is not active yet.** No RecallDock binary has been signed to date, and this notice will be replaced with an unconditional statement only after a genuinely signed release is published. Until then, verify downloads against `checksums.txt` as described above.
-
-### Roles
-
-| Role | Responsibility | Member |
-|---|---|---|
-| Author | Trusted to modify source without additional review | [@kings54188](https://github.com/kings54188) |
-| Reviewer | Reviews every change proposed by non-committers | [@kings54188](https://github.com/kings54188) |
-| Approver | Approves each individual signing request | [@kings54188](https://github.com/kings54188) |
-
-RecallDock is currently maintained by a single person, so all three roles are held by the same member. This is disclosed rather than presented as a separation of duties that does not exist.
-
-### Signed artefacts
-
-If signing is approved, only the Windows release packages (`recalldock_<version>_windows_amd64.zip`) produced by the GitHub Actions release workflow from a tagged commit will be submitted. Binaries built locally or by third parties are never signed.
+`checksums.txt` alone does not prove who built a package, because it is served from the same place as the package. Treat it as a corruption check. If you need a chain of provenance you can verify independently, build from a tagged commit yourself.
 
 ### Privacy
 
