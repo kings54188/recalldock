@@ -176,6 +176,38 @@ Adding or removing a server in `gateway.json` takes effect live on `tools_find` 
 
 ---
 
+## Code Signing Policy
+
+RecallDock intends to submit its Windows release builds for free code signing once the project meets the programme's reputation criteria. **As of `0.3.24`, Windows builds are not yet signed** — see the unsigned-binary notice above.
+
+### Signing programme
+
+RecallDock has applied-toward / intends to use free code signing for its Windows release builds. Once an application is approved and the first signed release ships, the arrangement will be:
+
+> Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+**That arrangement is not active yet.** No RecallDock binary has been signed to date, and this notice will be replaced with an unconditional statement only after a genuinely signed release is published. Until then, verify downloads against `checksums.txt` as described above.
+
+### Roles
+
+| Role | Responsibility | Member |
+|---|---|---|
+| Author | Trusted to modify source without additional review | [@kings54188](https://github.com/kings54188) |
+| Reviewer | Reviews every change proposed by non-committers | [@kings54188](https://github.com/kings54188) |
+| Approver | Approves each individual signing request | [@kings54188](https://github.com/kings54188) |
+
+RecallDock is currently maintained by a single person, so all three roles are held by the same member. This is disclosed rather than presented as a separation of duties that does not exist.
+
+### Signed artefacts
+
+If signing is approved, only the Windows release packages (`recalldock_<version>_windows_amd64.zip`) produced by the GitHub Actions release workflow from a tagged commit will be submitted. Binaries built locally or by third parties are never signed.
+
+### Privacy
+
+See [Privacy & Network Behaviour](docs/PRIVACY.md). In short: this program does not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+
+---
+
 ## Documentation
 
 - [Installation, Upgrade & Rollback (Linux)](docs/INSTALLATION.md)
@@ -184,6 +216,7 @@ Adding or removing a server in `gateway.json` takes effect live on `tools_find` 
 - [CLI Quickstart & Daily Usage](docs/LOCAL-QUICKSTART.md)
 - [Host Adapters & Compatibility Boundaries](docs/HOST-ADAPTERS.md)
 - [Security Boundaries](SECURITY.md) | [Gateway Security Model](docs/GATEWAY-AUTH.md)
+- [Privacy & Network Behaviour](docs/PRIVACY.md)
 - [Contributing](CONTRIBUTING.md)
 
 ---

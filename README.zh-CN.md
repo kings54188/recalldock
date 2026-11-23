@@ -176,6 +176,38 @@ recalldock gateway list
 
 ---
 
+## 代码签名策略（Code signing policy）
+
+RecallDock 计划在满足该计划的声誉要求后，将 Windows 正式构建提交免费代码签名。**截至 `0.3.24`，Windows 构建尚未签名** —— 见上方未签名程序提示。
+
+### 签名计划
+
+RecallDock 计划为其 Windows 正式构建使用免费代码签名。待申请获批并发布首个带签名的版本后，安排为：
+
+> Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)。
+
+**该安排目前尚未生效。** 迄今为止没有任何 RecallDock 二进制被签名，本提示只在真正发布带签名版本之后，才会替换为无条件的正式说明。在此之前，请按上文说明用 `checksums.txt` 校验下载。
+
+### 角色
+
+| 角色 | 职责 | 成员 |
+|---|---|---|
+| Author（作者） | 有权无需额外审核直接修改源码 | [@kings54188](https://github.com/kings54188) |
+| Reviewer（审核者） | 审核非提交者提出的每一项变更 | [@kings54188](https://github.com/kings54188) |
+| Approver（批准者） | 逐个批准每次签名请求 | [@kings54188](https://github.com/kings54188) |
+
+RecallDock 目前由单人维护，因此三个角色由同一人担任。此处如实披露，不把它包装成并不存在的职责分离。
+
+### 签名的产物
+
+若签名申请获批，仅提交由 GitHub Actions 发布流水线从已打 tag 的提交构建出的 Windows 正式包（`recalldock_<version>_windows_amd64.zip`）。本地构建或第三方构建的二进制永远不会被签名。
+
+### 隐私
+
+见 [隐私与网络行为](docs/PRIVACY.md)。简述：本程序除用户或安装、操作本程序的人明确要求外，不会向其他联网系统传输任何信息。
+
+---
+
 ## 详细文档
 
 - [Linux 安装、升级与回滚指南](docs/INSTALLATION.md)
@@ -184,6 +216,7 @@ recalldock gateway list
 - [CLI 快速上手与日常操作](docs/LOCAL-QUICKSTART.md)
 - [AI Agent 宿主适配与兼容边界](docs/HOST-ADAPTERS.md)
 - [安全模型与边界说明](SECURITY.md) | [Gateway 授权机制](docs/GATEWAY-AUTH.md)
+- [隐私与网络行为](docs/PRIVACY.md)
 - [参与贡献](CONTRIBUTING.md)
 
 ---
