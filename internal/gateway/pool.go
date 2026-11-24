@@ -288,26 +288,15 @@ func (p *Pool) Discover(serverID string) (Server, []opsstore.ToolRecord, error) 
 }
 
 type GrantOptions struct {
-	Tool     string
-	ReadOnly bool
-	Roots    []string
-	// Recursive opts this grant into covering descendants of each root. Per
-	// grant and explicit, so previously recorded grants keep exact-match
-	// semantics and no existing permission widens on upgrade.
-	Recursive bool
+	Tool      string
+	ReadOnly  bool
+	Roots     []string
 	Arguments any
 	Session   string
 	ExpiresAt string
 }
 
 func (p *Pool) Grant(serverID string, opts GrantOptions) (Grant, error) {
-	// Recursive coverage widens a grant from one directory to its whole subtree,
-	// so it is only offered for read-only tools. Enforcing it here as well as in
-	// the CLI means a caller that constructs GrantOptions directly cannot widen a
-	// side-effecting grant.
-	if opts.Recursive && !opts.ReadOnly {
-		return Grant{}, fmt.Errorf("%w: recursive grants are read-only; pass --read-only or drop --recursive", ErrInvalidRecursiveGrant)
-	}
 	reg, err := p.registry()
 	if err != nil {
 		return Grant{}, err
@@ -355,7 +344,7 @@ func (p *Pool) Grant(serverID string, opts GrantOptions) (Grant, error) {
 		roots = append(roots, canonicalPath(root))
 	}
 	sort.Strings(roots)
-	grant := Grant{ID: "g-" + strings.TrimPrefix(randomToken(), "lease-"), Tool: record.Name, SchemaHash: record.SchemaHash, Roots: roots, Recursive: opts.Recursive, ReadOnly: opts.ReadOnly}
+	grant := Grant{ID: "g-" + strings.TrimPrefix(randomToken(), "lease-"), Tool: record.Name, SchemaHash: record.SchemaHash, Roots: roots, ReadOnly: opts.ReadOnly}
 	if !opts.ReadOnly {
 		if opts.Session == "" || opts.ExpiresAt == "" || opts.Arguments == nil {
 			return Grant{}, errors.New("side-effecting grants require --session, --expires and --arguments (exact JSON)")

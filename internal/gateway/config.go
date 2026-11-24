@@ -26,12 +26,8 @@ var (
 	ErrUnavailable = errors.New("backend_unavailable: check the original configuration or authentication; no automatic retry")
 	ErrLease       = errors.New("lease_not_available: it expired, was released, belongs to another gateway session, or was issued for a different server/root; retry without lease to acquire a fresh one")
 	ErrUnknown     = errors.New("outcome_unknown: the request may have executed; verify external state before any retry")
-	// ErrInvalidRecursiveGrant rejects a recursive grant that is not read-only.
-	// Recursion widens a grant from one directory to its whole subtree, which is
-	// only defensible for a tool that cannot mutate what it reaches.
-	ErrInvalidRecursiveGrant = errors.New("recursive_grants_require_read_only: a grant may cover descendant directories only for a read-only tool")
-	serverName               = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,79}$`)
-	envName                  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	serverName     = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,79}$`)
+	envName        = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 const ConfigLimit = 2 << 20
@@ -44,21 +40,14 @@ type Source struct {
 }
 
 type Grant struct {
-	ID         string   `json:"id"`
-	Tool       string   `json:"tool"`
-	SchemaHash string   `json:"schema_hash"`
-	Roots      []string `json:"roots"`
-	// Recursive makes this grant also cover descendants of each root. It is
-	// additive and defaults to false, so a grant recorded before this field
-	// existed keeps its exact-match meaning: widening existing grants
-	// automatically would extend access to subdirectories the operator never
-	// named, and the old record carries no evidence of that consent.
-	// Operators opt in per grant with `gateway grant --recursive`.
-	Recursive     bool   `json:"recursive,omitempty"`
-	ArgumentsHash string `json:"arguments_hash,omitempty"`
-	Session       string `json:"session,omitempty"`
-	ExpiresAt     string `json:"expires_at,omitempty"`
-	ReadOnly      bool   `json:"read_only"`
+	ID            string   `json:"id"`
+	Tool          string   `json:"tool"`
+	SchemaHash    string   `json:"schema_hash"`
+	Roots         []string `json:"roots"`
+	ArgumentsHash string   `json:"arguments_hash,omitempty"`
+	Session       string   `json:"session,omitempty"`
+	ExpiresAt     string   `json:"expires_at,omitempty"`
+	ReadOnly      bool     `json:"read_only"`
 }
 
 type Server struct {
@@ -174,15 +163,6 @@ func ValidateRegistry(cfg Registry) error {
 			ids[g.ID] = true
 			if !g.ReadOnly && (len(g.ArgumentsHash) != 64 || g.Session == "" || g.ExpiresAt == "" || slices.Contains(g.Roots, "*")) {
 				return errors.New("side-effecting grants require exact arguments, root, session and expiry")
-			}
-			// A hand-written registry bypasses the CLI, so the same rule has to
-			// hold here: recursion is read-only, and a recursive grant may not
-			// name "*" because that would cover every absolute path on the host.
-			if g.Recursive && !g.ReadOnly {
-				return errors.New("recursive grants must be read_only; edit the registry or re-grant with --read-only")
-			}
-			if g.Recursive && slices.Contains(g.Roots, "*") {
-				return errors.New("recursive grants must name a concrete root, not \"*\"")
 			}
 			for _, root := range g.Roots {
 				if root != "*" && !filepath.IsAbs(root) {
@@ -445,7 +425,7 @@ func (s Server) Timeout() time.Duration {
 
 func (s Server) Allowed(tool, schemaHash, root, session string, arguments any) (Grant, bool) {
 	for _, g := range s.Grants {
-		if g.Tool != tool || g.SchemaHash != schemaHash || !g.coversRoot(root) {
+		if g.Tool != tool || g.SchemaHash != schemaHash || (!slices.Contains(g.Roots, root) && !slices.Contains(g.Roots, "*")) {
 			continue
 		}
 		if g.Session != "" && g.Session != session {
@@ -463,50 +443,4 @@ func (s Server) Allowed(tool, schemaHash, root, session string, arguments any) (
 		return g, true
 	}
 	return Grant{}, false
-}
-
-// coversRoot reports whether g authorizes a call at root. Both paths are already
-// canonical (absolute, symlink-resolved, cleaned) before this runs.
-//
-// Coverage is exact unless the grant opted into recursion. Recursive matching
-// stops at a path-separator boundary, so a grant on "/work/proj" covers
-// "/work/proj/sub" but never "/work/project-other"; a bare strings.HasPrefix
-// would have matched that sibling.
-func (g Grant) coversRoot(root string) bool {
-	if root == "" {
-		return false
-	}
-	for _, granted := range g.Roots {
-		if granted == "*" || granted == root {
-			return true
-		}
-		if g.Recursive && withinRoot(root, granted) {
-			return true
-		}
-	}
-	return false
-}
-
-// withinRoot reports whether path is a strict descendant of root, compared by
-// whole path segments. Windows compares case-insensitively to match the
-// canonicalPath normalization applied before this check.
-func withinRoot(path, root string) bool {
-	if root == "" || path == root {
-		return false
-	}
-	cleanPath := filepath.Clean(path)
-	cleanRoot := filepath.Clean(root)
-	if runtime.GOOS == "windows" {
-		cleanPath = strings.ToLower(cleanPath)
-		cleanRoot = strings.ToLower(cleanRoot)
-	}
-	if runtime.GOOS != "windows" && !strings.HasPrefix(cleanRoot, string(filepath.Separator)) {
-		// Relative roots are never valid grants; refuse rather than guess.
-		return false
-	}
-	prefix := cleanRoot
-	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
-		prefix += string(filepath.Separator)
-	}
-	return strings.HasPrefix(cleanPath, prefix)
 }
