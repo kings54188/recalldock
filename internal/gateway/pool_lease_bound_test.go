@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The contributor's tests build synthetic lease structs and call the reclaim
@@ -39,9 +40,12 @@ func TestProductionLeaseLimitIsFixed(t *testing.T) {
 func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	p, _, _ := poolFixture(t, false)
 	p.MaxLeases = 2
-	// Registered before any t.TempDir() so it runs after them (t.Cleanup is LIFO),
-	// which matters because backends hold their root as cwd.
-	t.Cleanup(p.Close)
+	// See the teardown note in TestReleasedLeaseFreesCapacity: wait for children
+	// before TempDir cleanup runs.
+	t.Cleanup(func() {
+		p.Close()
+		settleChildExit()
+	})
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -87,12 +91,17 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	p, _, _ := poolFixture(t, false)
 	p.MaxLeases = 1
-	// Backends run with their root as cwd, and on Windows a live child blocks
-	// TempDir cleanup ("the process cannot access the file because it is being
-	// used by another process"). t.Cleanup runs LIFO, so this must be registered
-	// BEFORE any t.TempDir() call below: otherwise the directory cleanup runs
-	// first, while the child still holds it.
-	t.Cleanup(p.Close)
+	// Backends are started with a temp directory as their cwd. On Windows the
+	// child's handle can outlive Close by a short interval, and TempDir.RemoveAll
+	// then fails with "the process cannot access the file because it is being
+	// used by another process" — which fails the test even though every
+	// assertion passed. Waiting here makes the teardown deterministic instead of
+	// racing the OS. Product code is unaffected; ErrLease and lease_limit
+	// behaviour do not depend on it.
+	t.Cleanup(func() {
+		p.Close()
+		settleChildExit()
+	})
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -219,4 +228,12 @@ func TestLeaseLimitErrorIsExplainable(t *testing.T) {
 	if errors.Is(err2, ErrApproval) {
 		t.Fatal("lease_limit must not be reported as an approval problem")
 	}
+}
+
+// settleChildExit gives the OS a moment to release handles held by a terminated
+// child. Windows does not make the release synchronous with process exit, and a
+// directory still open at TempDir cleanup fails the test after it has already
+// passed its assertions.
+func settleChildExit() {
+	time.Sleep(250 * time.Millisecond)
 }
