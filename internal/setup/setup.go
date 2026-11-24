@@ -1,21 +1,27 @@
-// Package setup handles agent plugin installation.
+// Package setup retains the historical agent-plugin installers.
 //
-//   - OpenCode: copies embedded plugin file to ~/.config/opencode/plugins/
-//     (patching RECALLDOCK_BIN to bake in the absolute binary path as a final
-//     fallback) and injects MCP registration in opencode.json using the
-//     resolved absolute binary path so child processes never require PATH
-//     resolution in headless/systemd environments.
+// It is NOT the supported install path. Install returns
+// ErrLegacyInstallerDisabled unless a test opts in, because the installers still
+// carry an upstream Engram payload (marketplace "Gentleman-Programming/engram",
+// npm "gentle-engram"). Shipped installs go through tools/install-local.py and
+// tools/install-windows.ps1.
+//
+// Historical scope, kept for reference and for the payload-building tests:
+//   - OpenCode: copies the embedded plugin file to the OpenCode plugin dir and
+//     injects MCP registration using the resolved absolute binary path so child
+//     processes never require PATH resolution in headless/systemd environments.
 //   - Claude Code: runs `claude plugin marketplace add` + `claude plugin install`,
-//     then writes a durable MCP config to ~/.claude/mcp/recalldock.json using the
-//     absolute binary path so the subprocess never needs PATH resolution.
+//     then writes a durable MCP config using the absolute binary path so the
+//     subprocess never needs PATH resolution.
 //   - Gemini CLI: injects MCP registration in ~/.gemini/settings.json
 //   - Codex: injects MCP registration in ~/.codex/config.toml
-//   - Pi: installs gentle-engram/pi-mcp-adapter packages and writes Pi MCP config
+//   - Pi: legacy package installs plus Pi MCP config
 package setup
 
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -269,9 +275,34 @@ func SupportedAgents() []Agent {
 	return agents
 }
 
+// ErrLegacyInstallerDisabled guards the retained upstream installer.
+//
+// This package still carries the Engram-era installers: they hardcode the
+// Gentleman-Programming/engram marketplace and npm:gentle-engram as their
+// payload, and several write prompts that identify the product as Engram. They
+// are unreachable from the CLI today only because cmd/recalldock/main.go routes
+// "setup" to runLocalSetup and returns, but that is one reordering away from
+// being live again.
+//
+// The shipped install path is tools/install-local.py (Linux) and
+// tools/install-windows.ps1 (Windows). This sentinel makes the legacy path fail
+// closed wherever it is called from, so reordering the dispatcher can no longer
+// silently install a different project.
+var ErrLegacyInstallerDisabled = errors.New("the legacy agent installer is disabled in this build; use tools/install-local.py or tools/install-windows.ps1 instead (it installs RecallDock, never an upstream Engram marketplace)")
+
+// legacyInstallerEnabled exists so tests that cover the retained installer
+// plumbing can opt in through TestMain. Production code never sets it.
+var legacyInstallerEnabled bool
+
 // Install installs the plugin for the given agent by looking it up in the
 // registry and running its adapter (a bespoke installer or the generic driver).
+//
+// It refuses unless the legacy installer was explicitly enabled for a test: see
+// ErrLegacyInstallerDisabled.
 func Install(agentName string) (*Result, error) {
+	if !legacyInstallerEnabled {
+		return nil, ErrLegacyInstallerDisabled
+	}
 	for _, a := range agentAdapters() {
 		if a.slug == agentName {
 			return installFromAdapter(a)
