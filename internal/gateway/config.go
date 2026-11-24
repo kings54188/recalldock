@@ -40,14 +40,21 @@ type Source struct {
 }
 
 type Grant struct {
-	ID            string   `json:"id"`
-	Tool          string   `json:"tool"`
-	SchemaHash    string   `json:"schema_hash"`
-	Roots         []string `json:"roots"`
-	ArgumentsHash string   `json:"arguments_hash,omitempty"`
-	Session       string   `json:"session,omitempty"`
-	ExpiresAt     string   `json:"expires_at,omitempty"`
-	ReadOnly      bool     `json:"read_only"`
+	ID         string   `json:"id"`
+	Tool       string   `json:"tool"`
+	SchemaHash string   `json:"schema_hash"`
+	Roots      []string `json:"roots"`
+	// Recursive makes this grant also cover descendants of each root. It is
+	// additive and defaults to false, so a grant recorded before this field
+	// existed keeps its exact-match meaning: widening existing grants
+	// automatically would extend access to subdirectories the operator never
+	// named, and the old record carries no evidence of that consent.
+	// Operators opt in per grant with `gateway grant --recursive`.
+	Recursive     bool   `json:"recursive,omitempty"`
+	ArgumentsHash string `json:"arguments_hash,omitempty"`
+	Session       string `json:"session,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	ReadOnly      bool   `json:"read_only"`
 }
 
 type Server struct {
@@ -425,7 +432,7 @@ func (s Server) Timeout() time.Duration {
 
 func (s Server) Allowed(tool, schemaHash, root, session string, arguments any) (Grant, bool) {
 	for _, g := range s.Grants {
-		if g.Tool != tool || g.SchemaHash != schemaHash || (!slices.Contains(g.Roots, root) && !slices.Contains(g.Roots, "*")) {
+		if g.Tool != tool || g.SchemaHash != schemaHash || !g.coversRoot(root) {
 			continue
 		}
 		if g.Session != "" && g.Session != session {
@@ -443,4 +450,50 @@ func (s Server) Allowed(tool, schemaHash, root, session string, arguments any) (
 		return g, true
 	}
 	return Grant{}, false
+}
+
+// coversRoot reports whether g authorizes a call at root. Both paths are already
+// canonical (absolute, symlink-resolved, cleaned) before this runs.
+//
+// Coverage is exact unless the grant opted into recursion. Recursive matching
+// stops at a path-separator boundary, so a grant on "/work/proj" covers
+// "/work/proj/sub" but never "/work/project-other"; a bare strings.HasPrefix
+// would have matched that sibling.
+func (g Grant) coversRoot(root string) bool {
+	if root == "" {
+		return false
+	}
+	for _, granted := range g.Roots {
+		if granted == "*" || granted == root {
+			return true
+		}
+		if g.Recursive && withinRoot(root, granted) {
+			return true
+		}
+	}
+	return false
+}
+
+// withinRoot reports whether path is a strict descendant of root, compared by
+// whole path segments. Windows compares case-insensitively to match the
+// canonicalPath normalization applied before this check.
+func withinRoot(path, root string) bool {
+	if root == "" || path == root {
+		return false
+	}
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	if runtime.GOOS == "windows" {
+		cleanPath = strings.ToLower(cleanPath)
+		cleanRoot = strings.ToLower(cleanRoot)
+	}
+	if runtime.GOOS != "windows" && !strings.HasPrefix(cleanRoot, string(filepath.Separator)) {
+		// Relative roots are never valid grants; refuse rather than guess.
+		return false
+	}
+	prefix := cleanRoot
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	return strings.HasPrefix(cleanPath, prefix)
 }

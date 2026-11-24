@@ -242,9 +242,13 @@ func (p *Pool) Discover(serverID string) (Server, []opsstore.ToolRecord, error) 
 }
 
 type GrantOptions struct {
-	Tool      string
-	ReadOnly  bool
-	Roots     []string
+	Tool     string
+	ReadOnly bool
+	Roots    []string
+	// Recursive opts this grant into covering descendants of each root. Per
+	// grant and explicit, so previously recorded grants keep exact-match
+	// semantics and no existing permission widens on upgrade.
+	Recursive bool
 	Arguments any
 	Session   string
 	ExpiresAt string
@@ -298,7 +302,7 @@ func (p *Pool) Grant(serverID string, opts GrantOptions) (Grant, error) {
 		roots = append(roots, canonicalPath(root))
 	}
 	sort.Strings(roots)
-	grant := Grant{ID: "g-" + strings.TrimPrefix(randomToken(), "lease-"), Tool: record.Name, SchemaHash: record.SchemaHash, Roots: roots, ReadOnly: opts.ReadOnly}
+	grant := Grant{ID: "g-" + strings.TrimPrefix(randomToken(), "lease-"), Tool: record.Name, SchemaHash: record.SchemaHash, Roots: roots, Recursive: opts.Recursive, ReadOnly: opts.ReadOnly}
 	if !opts.ReadOnly {
 		if opts.Session == "" || opts.ExpiresAt == "" || opts.Arguments == nil {
 			return Grant{}, errors.New("side-effecting grants require --session, --expires and --arguments (exact JSON)")
