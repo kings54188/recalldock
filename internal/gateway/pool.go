@@ -26,8 +26,11 @@ type Pool struct {
 	Host          string // trusted launcher configuration, never a model argument
 	HostSessionID string
 	Trust         string // "agent" (local host delegate) or "strict" (exact grants)
-	mu            sync.Mutex
-	leases        map[string]*lease
+	// MaxLeases overrides maxConcurrentLeases when positive. Test-only: the
+	// production bound is a constant so an operator cannot raise it by accident.
+	MaxLeases int
+	mu        sync.Mutex
+	leases    map[string]*lease
 }
 
 type lease struct {
@@ -59,6 +62,17 @@ func NewPool(registryPath string, ops *opsstore.Store) *Pool {
 // processes than the registry can meaningfully describe.
 const maxConcurrentLeases = 512
 
+// leaseLimit is the effective bound for this pool. It defaults to
+// maxConcurrentLeases and exists as a field so tests can exercise the boundary
+// with a handful of synthetic leases instead of spawning 512 real backends.
+// Production code never sets it.
+func (p *Pool) leaseLimit() int {
+	if p.MaxLeases > 0 {
+		return p.MaxLeases
+	}
+	return maxConcurrentLeases
+}
+
 // reclaimIdleLeaseLocked frees leases that are provably safe to drop and then
 // fails when the pool is still at its bound. Callers must hold p.mu.
 //
@@ -66,7 +80,8 @@ const maxConcurrentLeases = 512
 // in-flight tools_call would break that call, so a referenced lease is kept and
 // the caller is refused instead.
 func (p *Pool) reclaimIdleLeaseLocked() error {
-	if len(p.leases) < maxConcurrentLeases {
+	limit := p.leaseLimit()
+	if len(p.leases) < limit {
 		return nil
 	}
 	for token, l := range p.leases {
@@ -79,7 +94,7 @@ func (p *Pool) reclaimIdleLeaseLocked() error {
 			l.shutdown(true)
 		}
 	}
-	if len(p.leases) >= maxConcurrentLeases {
+	if len(p.leases) >= limit {
 		return fmt.Errorf("lease_limit: %d concurrent backend leases are in use; close one with tools_release and retry", len(p.leases))
 	}
 	return nil
@@ -273,15 +288,26 @@ func (p *Pool) Discover(serverID string) (Server, []opsstore.ToolRecord, error) 
 }
 
 type GrantOptions struct {
-	Tool      string
-	ReadOnly  bool
-	Roots     []string
+	Tool     string
+	ReadOnly bool
+	Roots    []string
+	// Recursive opts this grant into covering descendants of each root. Per
+	// grant and explicit, so previously recorded grants keep exact-match
+	// semantics and no existing permission widens on upgrade.
+	Recursive bool
 	Arguments any
 	Session   string
 	ExpiresAt string
 }
 
 func (p *Pool) Grant(serverID string, opts GrantOptions) (Grant, error) {
+	// Recursive coverage widens a grant from one directory to its whole subtree,
+	// so it is only offered for read-only tools. Enforcing it here as well as in
+	// the CLI means a caller that constructs GrantOptions directly cannot widen a
+	// side-effecting grant.
+	if opts.Recursive && !opts.ReadOnly {
+		return Grant{}, fmt.Errorf("%w: recursive grants are read-only; pass --read-only or drop --recursive", ErrInvalidRecursiveGrant)
+	}
 	reg, err := p.registry()
 	if err != nil {
 		return Grant{}, err
@@ -329,7 +355,7 @@ func (p *Pool) Grant(serverID string, opts GrantOptions) (Grant, error) {
 		roots = append(roots, canonicalPath(root))
 	}
 	sort.Strings(roots)
-	grant := Grant{ID: "g-" + strings.TrimPrefix(randomToken(), "lease-"), Tool: record.Name, SchemaHash: record.SchemaHash, Roots: roots, ReadOnly: opts.ReadOnly}
+	grant := Grant{ID: "g-" + strings.TrimPrefix(randomToken(), "lease-"), Tool: record.Name, SchemaHash: record.SchemaHash, Roots: roots, Recursive: opts.Recursive, ReadOnly: opts.ReadOnly}
 	if !opts.ReadOnly {
 		if opts.Session == "" || opts.ExpiresAt == "" || opts.Arguments == nil {
 			return Grant{}, errors.New("side-effecting grants require --session, --expires and --arguments (exact JSON)")

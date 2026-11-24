@@ -276,13 +276,19 @@ func runGateway(args []string) (err error) {
 		}
 		return json.NewEncoder(os.Stdout).Encode(items)
 	case "grant":
+		// Recursion extends a grant to every descendant of the root, so require
+		// the operator to state read-only intent explicitly as well. Pool.Grant
+		// repeats this check for callers that bypass the CLI.
+		if flags["--recursive"] && !flags["--read-only"] {
+			return errors.New("--recursive requires --read-only: descendant coverage is only offered for tools that cannot modify what they reach")
+		}
 		var arguments any
 		if values["--arguments"] != "" {
 			if err := readGatewayJSON(values["--arguments"], &arguments); err != nil {
 				return err
 			}
 		}
-		grant, err := pool.Grant(id, gateway.GrantOptions{Tool: values["--tool"], ReadOnly: flags["--read-only"], Roots: []string{values["--root"]}, Arguments: arguments, Session: values["--session"], ExpiresAt: values["--expires"]})
+		grant, err := pool.Grant(id, gateway.GrantOptions{Tool: values["--tool"], ReadOnly: flags["--read-only"], Recursive: flags["--recursive"], Roots: []string{values["--root"]}, Arguments: arguments, Session: values["--session"], ExpiresAt: values["--expires"]})
 		if err != nil {
 			return err
 		}
