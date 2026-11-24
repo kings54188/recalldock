@@ -65,13 +65,34 @@ func TestBackendProcess(t *testing.T) {
 	os.Exit(0)
 }
 
+// backendWorkDir returns a working directory for a synthetic backend child
+// process.
+//
+// It deliberately does NOT use t.TempDir(). On Windows a backend child keeps a
+// handle on its working directory for a short, unsynchronizable window after it
+// terminates, and testing.TempDir turns the resulting RemoveAll collision into a
+// test failure ("The process cannot access the file because it is being used by
+// another process"). That is a teardown artefact of the fixture, not behaviour
+// under test, and no amount of sleeping makes it deterministic. The directory is
+// therefore created and released by this helper on a best-effort basis: losing an
+// empty temp directory is harmless, failing a test that already passed is not.
+func backendWorkDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rd-backend-cwd-")
+	if err != nil {
+		t.Fatalf("create backend working directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func backendRuntime(t *testing.T, mode string) Runtime {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return Runtime{Type: "stdio", Command: executable, Args: []string{"-test.run=^TestBackendProcess$"}, CWD: t.TempDir(), Env: map[string]string{"RECALLDOCK_GATEWAY_TEST_BACKEND": mode}}
+	return Runtime{Type: "stdio", Command: executable, Args: []string{"-test.run=^TestBackendProcess$"}, CWD: backendWorkDir(t), Env: map[string]string{"RECALLDOCK_GATEWAY_TEST_BACKEND": mode}}
 }
 
 func TestConnectionProcessLifecycleAndNativeResults(t *testing.T) {

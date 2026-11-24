@@ -26,9 +26,12 @@ type Pool struct {
 	Host          string // trusted launcher configuration, never a model argument
 	HostSessionID string
 	Trust         string // "agent" (local host delegate) or "strict" (exact grants)
-	// MaxLeases overrides maxConcurrentLeases when positive. Test-only: the
-	// production bound is a constant so an operator cannot raise it by accident.
-	MaxLeases int
+	// maxLeases overrides maxConcurrentLeases when positive. It is unexported on
+	// purpose: the bound is a fixed production constant, and an exported field
+	// would let any caller (or a future config parser) raise or lift it. Only
+	// tests in this package can lower it, and only to reach the boundary with a
+	// few synthetic leases instead of 512 real backend processes.
+	maxLeases int
 	mu        sync.Mutex
 	leases    map[string]*lease
 }
@@ -63,12 +66,13 @@ func NewPool(registryPath string, ops *opsstore.Store) *Pool {
 const maxConcurrentLeases = 512
 
 // leaseLimit is the effective bound for this pool. It defaults to
-// maxConcurrentLeases and exists as a field so tests can exercise the boundary
-// with a handful of synthetic leases instead of spawning 512 real backends.
-// Production code never sets it.
+// maxConcurrentLeases and exists as an unexported field so tests in this package
+// can exercise the boundary with a handful of synthetic leases instead of
+// spawning 512 real backends. Production code never sets it, and nothing outside
+// this package can: the bound is not operator-configurable.
 func (p *Pool) leaseLimit() int {
-	if p.MaxLeases > 0 {
-		return p.MaxLeases
+	if p.maxLeases > 0 {
+		return p.maxLeases
 	}
 	return maxConcurrentLeases
 }
