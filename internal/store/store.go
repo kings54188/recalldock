@@ -1121,7 +1121,16 @@ func New(cfg Config) (*Store, error) {
 	dbPath := filepath.Join(cfg.DataDir, "recalldock.db")
 	dsn := dbPath
 	if cfg.RequireExisting {
-		dsn = sqliteFileURI(dbPath, "mode=rw")
+		// _txlock=immediate matches internal/opsstore so both databases open
+		// transactions the same way: a DEFERRED transaction that reads before it
+		// writes must upgrade to a write lock, and SQLite does not retry that
+		// upgrade when another writer is active, so busy_timeout never covers it.
+		//
+		// Scope note: the plain-path branch above is deliberately left as it was.
+		// It already resolves to mode=rwc by SQLite's default, and rewriting it
+		// as an explicit URI would be an unrelated change to how the database
+		// file gets created.
+		dsn = sqliteFileURI(dbPath, "mode=rw&_txlock=immediate")
 	}
 	db, err := openDB("sqlite", dsn)
 	if err != nil {
