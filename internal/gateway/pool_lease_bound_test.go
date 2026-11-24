@@ -39,6 +39,9 @@ func TestProductionLeaseLimitIsFixed(t *testing.T) {
 func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	p, _, _ := poolFixture(t, false)
 	p.MaxLeases = 2
+	// Registered before any t.TempDir() so it runs after them (t.Cleanup is LIFO),
+	// which matters because backends hold their root as cwd.
+	t.Cleanup(p.Close)
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -75,12 +78,8 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 		t.Fatalf("pool exceeded its bound: %d leases", got)
 	}
 
-	for _, l := range held {
-		l.shutdown(true)
-	}
-	// Backends use their root as cwd; closing the pool guarantees no child
-	// survives into TempDir cleanup, which Windows enforces strictly.
-	p.Close()
+	// The t.Cleanup registered above shuts these down.
+	_ = held
 }
 
 // TestReleasedLeaseFreesCapacity proves a released lease returns its slot, so
@@ -88,6 +87,12 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	p, _, _ := poolFixture(t, false)
 	p.MaxLeases = 1
+	// Backends run with their root as cwd, and on Windows a live child blocks
+	// TempDir cleanup ("the process cannot access the file because it is being
+	// used by another process"). t.Cleanup runs LIFO, so this must be registered
+	// BEFORE any t.TempDir() call below: otherwise the directory cleanup runs
+	// first, while the child still holds it.
+	t.Cleanup(p.Close)
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -97,23 +102,6 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	}
 	server := reg.Servers["test"]
 	ctx := context.Background()
-
-	// Backends run with their root as cwd, and on Windows a live child blocks
-	// TempDir cleanup ("the process cannot access the file because it is being
-	// used by another process"). Hold every lease so the test can close them.
-	closeAll := func() {
-		p.mu.Lock()
-		held := make([]*lease, 0, len(p.leases))
-		for _, l := range p.leases {
-			held = append(held, l)
-		}
-		p.mu.Unlock()
-		for _, l := range held {
-			l.shutdown(true)
-		}
-		p.Close()
-	}
-	t.Cleanup(closeAll)
 
 	l, err := p.acquire(ctx, "test", t.TempDir(), "s", server)
 	if err != nil {
