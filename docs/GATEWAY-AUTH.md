@@ -44,6 +44,22 @@ recalldock gateway discover --server recalldock-memory
 
 agent 模式不是跨用户隔离，也不把模型自报的 approval 当权限；它是操作人选择“让本机宿主代理调用”的一次性启动决定。需要恢复逐工具授权时用 strict；`gateway list` 会显示当前 `trust`。`tools_call` 仍不能由模型选择另一个 gateway session，也不能绕过 catalog/schema 校验。
 
+### agent 模式究竟保证了什么（0.3.25 澄清）
+
+外部评测指出“默认 agent 让 grant 模型失效”。这是**设计意图**，不是缺陷，但边界要写清楚，避免被读成“已开启逐工具权限系统”。
+
+| 项目 | agent 模式下的行为 |
+|---|---|
+| 逐工具 grant | **不检查**。已 `--enable` 的后端，其目录内工具无需 grant 即可调用 |
+| 绝对 `root` | **接受调用方提供的任意绝对路径**，不要求与某个 grant 的 roots 匹配 |
+| root 相对路径 | 仍然拒绝（`ErrApproval`） |
+| 后端 `enabled` / `start_allowed` | 仍然强制；禁用后端不服务 |
+| 宿主绑定 | 仍然强制；`--host` 与后端 `host` 不符时拒绝 |
+| 工具发现 | 仍需先 `tools_describe`（`refresh=true`）或 `discover`，未入目录的工具不可调用 |
+| 实时 schema | 仍按 live schema 校验，漂移时拒绝 |
+
+因此 agent 模式的授权面收敛为一句：**谁能启动这个网关、谁决定 `--enable` 哪些后端**。它适合单机“相信本机宿主”的场景；需要逐工具/逐路径最小权限时必须显式 `--trust strict`。`internal/gateway/trust_boundary_test.go` 固定了上表中“仍然强制”的各行，防止它们随重构静默失效。
+
 ## 内置工具 schema（0.3.8+）
 
 网关固定 7 个工具都有自己的输入 schema；`work_checkpoint` 的进度对象不再用空对象占位，模型不需要猜字段：
