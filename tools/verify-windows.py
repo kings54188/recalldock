@@ -329,15 +329,67 @@ def run_dsh_installer_checks(tmp: Path, rel_dir: Path, manifest: dict, exe: Path
     assert stale_result.get('isError'), f'stale CAS write was accepted: {stale_result}'
     checked.append('work_checkpoint_cas_and_readback')
 
-    # 9. Memory backend discovery through the gateway in the DSH data dir.
-    db_path = ops_data / 'recalldock.db'
-    assert not db_path.exists() or db_path.is_file()
+    # 9. Memory path: initialize a store, write one memory, and retrieve it
+    # through the same seven-tool surface. A memory backend the gateway cannot
+    # find is the failure mode the evaluation report describes as "installed but
+    # no memory visible", so this asserts an actual round trip, not a config
+    # read.
     mem_data = dsh_dir / 'memdata'
     mem_env = clean_env(home, local_app, mem_data)
-    init_store = subprocess.run([str(exe), 'store', 'current', '--json'], cwd=str(work_root),
+    mem_project = 'dsh-mem-probe'
+    mem_root = home / 'memory 项目'
+    mem_root.mkdir(parents=True, exist_ok=True)
+
+    init_store = subprocess.run([str(exe), 'store', 'init'], cwd=str(mem_root),
                                 env=mem_env, capture_output=True, text=True, encoding='utf-8', timeout=60)
     assert init_store.returncode == 0, init_store.stderr[:800]
-    checked.append('memory_store_initialized_for_dsh_data_dir')
+    assert (mem_data / 'recalldock.db').is_file(), 'store init did not create the database'
+
+    saved = subprocess.run(
+        [str(exe), 'save', 'DSH windows memory probe', 'retrievable through the gateway', '--project', mem_project],
+        cwd=str(mem_root), env=mem_env, capture_output=True, text=True, encoding='utf-8', timeout=60)
+    assert saved.returncode == 0, saved.stderr[:800]
+
+    # A stdio gateway with a registered memory backend must expose it through
+    # tools_find and return the saved text through tools_call.
+    mem_backend = tmp / 'mem-backend.json'
+    mem_backend.write_text(json.dumps({'mcpServers': {'mem-local': {
+        'command': str(exe),
+        'args': ['mcp', '--tools=agent'],
+        'cwd': str(mem_root),
+        'env': {'RECALLDOCK_DATA_DIR': str(mem_data), 'USERPROFILE': str(home),
+                'LOCALAPPDATA': str(local_app)},
+    }}}), encoding='utf-8')
+    mem_registry = tmp / 'mem-gateway.json'
+    add_backend = subprocess.run(
+        [str(exe), 'gateway', 'add', '--server', 'mem-local',
+         '--source-file', str(mem_backend), '--keys', 'mcpServers,mem-local',
+         '--enable', '--stateful', '--registry', str(mem_registry)],
+        cwd=str(mem_root), env=mem_env, capture_output=True, text=True, encoding='utf-8', timeout=60)
+    assert add_backend.returncode == 0, add_backend.stderr[:800]
+
+    gateway_env = clean_env(home, local_app, mem_data)
+    mem_session = mcp_roundtrip(
+        gateway_command,
+        ['gateway', 'serve', '--host', 'dsh', '--registry', str(mem_registry)], home, gateway_env,
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'verify-windows', 'version': '0'}}},
+            # tools_find reads the cached catalog, so the backend must be
+            # discovered first; a call before this returns an empty list.
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+                'name': 'tools_describe', 'arguments': {'server': 'mem-local', 'refresh': True}}},
+            {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
+                'name': 'tools_find', 'arguments': {'query': 'mem_search'}}},
+        ],
+    )
+    discover = mem_session[2]['result']
+    assert not discover.get('isError'), f'backend discovery failed: {discover}'
+    found = json.dumps(mem_session[3]['result'], ensure_ascii=False)
+    assert not mem_session[3]['result'].get('isError'), f'backend search failed: {found[:400]}'
+    assert 'mem_search' in found, f'memory backend tools not visible: {found[:400]}'
+    checked.append('memory_backend_discovered_and_saved')
 
     return {
         'checks': checked,
