@@ -78,6 +78,9 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	for _, l := range held {
 		l.shutdown(true)
 	}
+	// Backends use their root as cwd; closing the pool guarantees no child
+	// survives into TempDir cleanup, which Windows enforces strictly.
+	p.Close()
 }
 
 // TestReleasedLeaseFreesCapacity proves a released lease returns its slot, so
@@ -95,6 +98,23 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	server := reg.Servers["test"]
 	ctx := context.Background()
 
+	// Backends run with their root as cwd, and on Windows a live child blocks
+	// TempDir cleanup ("the process cannot access the file because it is being
+	// used by another process"). Hold every lease so the test can close them.
+	closeAll := func() {
+		p.mu.Lock()
+		held := make([]*lease, 0, len(p.leases))
+		for _, l := range p.leases {
+			held = append(held, l)
+		}
+		p.mu.Unlock()
+		for _, l := range held {
+			l.shutdown(true)
+		}
+		p.Close()
+	}
+	t.Cleanup(closeAll)
+
 	l, err := p.acquire(ctx, "test", t.TempDir(), "s", server)
 	if err != nil {
 		t.Fatalf("first lease: %v", err)
@@ -109,8 +129,13 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	if err := p.Release(l.token); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if _, err := p.acquire(ctx, "test", t.TempDir(), "s", server); err != nil {
+	after, err := p.acquire(ctx, "test", t.TempDir(), "s", server)
+	if err != nil {
 		t.Fatalf("lease after release was refused: %v", err)
+	}
+	// Release explicitly as well, so cleanup has no live child to wait on.
+	if err := p.Release(after.token); err != nil {
+		t.Fatalf("release second lease: %v", err)
 	}
 }
 
