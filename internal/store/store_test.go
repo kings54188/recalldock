@@ -302,6 +302,13 @@ func TestPinnedObservationsAndFormatContextPriority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("export project before pin: %v", err)
 	}
+	// ExportedAt is the wall-clock time of the call, with one-second resolution
+	// (store.Now formats "2006-01-02 15:04:05"). Comparing the marshalled dump
+	// byte-for-byte therefore fails whenever the two exports straddle a second
+	// boundary, which happens under -race where each export takes longer. That is
+	// a property of the timestamp, not of pinning, so the payload comparison
+	// below normalises it and keeps every other field byte-identical.
+	exportedBeforePin.ExportedAt = ""
 	exportedBeforePinJSON, err := json.Marshal(exportedBeforePin)
 	if err != nil {
 		t.Fatalf("marshal export before pin: %v", err)
@@ -351,6 +358,7 @@ func TestPinnedObservationsAndFormatContextPriority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("export project: %v", err)
 	}
+	exported.ExportedAt = ""
 	exportedJSON, err := json.Marshal(exported)
 	if err != nil {
 		t.Fatalf("marshal export: %v", err)

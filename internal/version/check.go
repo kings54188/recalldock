@@ -166,9 +166,9 @@ func updateCheckDisabled() bool {
 func updateInstructions() string {
 	if root := strings.TrimSpace(os.Getenv("RECALLDOCK_SOURCE_ROOT")); root != "" {
 		quotedRoot := "'" + strings.ReplaceAll(root, "'", "'\"'\"'") + "'"
-		return fmt.Sprintf("  Rebuild RecallDock from the reviewed local checkout:\n    cd %s && go build -o bin/recalldock.bin ./cmd/engram\n  Do not install an unrelated upstream release.", quotedRoot)
+		return fmt.Sprintf("  Rebuild RecallDock from the reviewed local checkout:\n    cd %s && go build -o bin/recalldock.bin ./cmd/recalldock\n  Do not install an unrelated upstream release.", quotedRoot)
 	}
-	return "  Rebuild RecallDock from the reviewed local checkout:\n    go build -o bin/recalldock.bin ./cmd/engram\n  Set RECALLDOCK_SOURCE_ROOT for the exact local command. Do not install an unrelated upstream release."
+	return "  Rebuild RecallDock from the reviewed local checkout:\n    go build -o bin/recalldock.bin ./cmd/recalldock\n  Set RECALLDOCK_SOURCE_ROOT for the exact local command. Do not install an unrelated upstream release."
 }
 
 func githubToken() string {

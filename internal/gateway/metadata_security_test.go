@@ -50,11 +50,17 @@ func TestGatewayMetadataBackend(t *testing.T) {
 
 func TestGatewayWriteGrantDropsUnapprovedMetadataAndForwardsProgress(t *testing.T) {
 	dir := t.TempDir()
+	// The backend child needs a working directory of its own, and it must not be
+	// the TempDir holding the ops store and registry: on Windows a terminating
+	// child holds a handle on its cwd briefly, which would make RemoveAll fail
+	// after the assertions had already passed. The backend reads and writes its
+	// progress sentinels through this directory instead, so pass it in the env.
+	backendDir := backendWorkDir(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := Runtime{Type: "stdio", Command: exe, Args: []string{"-test.run=^TestGatewayMetadataBackend$"}, CWD: dir, Env: map[string]string{"RECALLDOCK_GATEWAY_METADATA_BACKEND": "1"}}
+	runtime := Runtime{Type: "stdio", Command: exe, Args: []string{"-test.run=^TestGatewayMetadataBackend$"}, CWD: backendDir, Env: map[string]string{"RECALLDOCK_GATEWAY_METADATA_BACKEND": "1"}}
 	source := sourceFixture(t, "json", "{}")
 	raw, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
 	if err = os.WriteFile(source.Path, raw, 0600); err != nil {
@@ -137,12 +143,12 @@ func TestGatewayWriteGrantDropsUnapprovedMetadataAndForwardsProgress(t *testing.
 		t.Fatalf("metadata reached backend without notification callback: %+v %v", directSeen, err)
 	}
 	notices := make(chan mcp.JSONRPCNotification, 1)
-	if err := os.WriteFile(filepath.Join(dir, ".wait-progress"), nil, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(backendDir, ".wait-progress"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	notificationResult, _, err := p.Call(ctx, CallRequest{Server: "test", Tool: "write", Root: root, Session: body.Data.Session, Arguments: args, ExpectedSchemaHash: grant.SchemaHash, Meta: &mcp.Meta{ProgressToken: "host-token", AdditionalFields: map[string]any{"scope": "foreign"}}, Notify: func(n mcp.JSONRPCNotification) {
 		notices <- n
-		_ = os.WriteFile(filepath.Join(dir, ".ack-progress"), nil, 0600)
+		_ = os.WriteFile(filepath.Join(backendDir, ".ack-progress"), nil, 0600)
 	}})
 	if err != nil {
 		t.Fatal(err)

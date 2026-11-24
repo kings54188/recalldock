@@ -26,8 +26,14 @@ type Pool struct {
 	Host          string // trusted launcher configuration, never a model argument
 	HostSessionID string
 	Trust         string // "agent" (local host delegate) or "strict" (exact grants)
-	mu            sync.Mutex
-	leases        map[string]*lease
+	// maxLeases overrides maxConcurrentLeases when positive. It is unexported on
+	// purpose: the bound is a fixed production constant, and an exported field
+	// would let any caller (or a future config parser) raise or lift it. Only
+	// tests in this package can lower it, and only to reach the boundary with a
+	// few synthetic leases instead of 512 real backend processes.
+	maxLeases int
+	mu        sync.Mutex
+	leases    map[string]*lease
 }
 
 type lease struct {
@@ -52,6 +58,50 @@ type CallRequest struct {
 
 func NewPool(registryPath string, ops *opsstore.Store) *Pool {
 	return &Pool{RegistryPath: registryPath, Ops: ops, IdleTTL: 5 * time.Minute, Trust: "agent", leases: map[string]*lease{}}
+}
+
+// maxConcurrentLeases bounds live backend processes (not registered servers).
+// It matches the per-server grant cap so a gateway cannot hold more child
+// processes than the registry can meaningfully describe.
+const maxConcurrentLeases = 512
+
+// leaseLimit is the effective bound for this pool. It defaults to
+// maxConcurrentLeases and exists as an unexported field so tests in this package
+// can exercise the boundary with a handful of synthetic leases instead of
+// spawning 512 real backends. Production code never sets it, and nothing outside
+// this package can: the bound is not operator-configurable.
+func (p *Pool) leaseLimit() int {
+	if p.maxLeases > 0 {
+		return p.maxLeases
+	}
+	return maxConcurrentLeases
+}
+
+// reclaimIdleLeaseLocked frees leases that are provably safe to drop and then
+// fails when the pool is still at its bound. Callers must hold p.mu.
+//
+// Only unreferenced leases are candidates: dropping one that is serving an
+// in-flight tools_call would break that call, so a referenced lease is kept and
+// the caller is refused instead.
+func (p *Pool) reclaimIdleLeaseLocked() error {
+	limit := p.leaseLimit()
+	if len(p.leases) < limit {
+		return nil
+	}
+	for token, l := range p.leases {
+		l.mu.Lock()
+		conn := l.conn
+		drop := l.refs == 0 && (l.released || conn == nil || !conn.Alive())
+		l.mu.Unlock()
+		if drop {
+			delete(p.leases, token)
+			l.shutdown(true)
+		}
+	}
+	if len(p.leases) >= limit {
+		return fmt.Errorf("lease_limit: %d concurrent backend leases are in use; close one with tools_release and retry", len(p.leases))
+	}
+	return nil
 }
 
 func randomToken() string {
@@ -385,9 +435,12 @@ func (l *lease) shutdown(force bool) {
 		l.timer.Stop()
 	}
 	closeNow := l.refs == 0 || force
+	conn := l.conn
 	l.mu.Unlock()
-	if closeNow {
-		l.conn.Close()
+	// A lease that never finished acquiring has no connection; shutdown is
+	// still the right call for it, so tolerate the nil rather than panic.
+	if closeNow && conn != nil {
+		conn.Close()
 	}
 }
 
@@ -397,9 +450,10 @@ func (l *lease) done() {
 		l.refs--
 	}
 	closeNow := l.refs == 0 && l.released
+	conn := l.conn
 	l.mu.Unlock()
-	if closeNow {
-		l.conn.Close()
+	if closeNow && conn != nil {
+		conn.Close()
 	}
 }
 
@@ -463,6 +517,13 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 	}
 	if !server.StartAllowed {
 		return nil, ErrApproval
+	}
+	// Leases are keyed by (server, root, session), so a caller that varies root
+	// can start one backend process per root until handles run out. Grants are
+	// already capped at 512 per server; leases were not bounded at all.
+	// Reclaim what is provably idle, then refuse rather than spawn past the cap.
+	if err := p.reclaimIdleLeaseLocked(); err != nil {
+		return nil, err
 	}
 	runtime, hash, err := server.Source.Read()
 	if err != nil {

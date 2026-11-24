@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -250,5 +252,47 @@ func withCheckTimeout(t *testing.T, timeout time.Duration) {
 func TestNonOKStatusMessage(t *testing.T) {
 	if got := nonOKStatusMessage(fmt.Sprintf("%d %s", http.StatusUnauthorized, http.StatusText(http.StatusUnauthorized))); !strings.Contains(got, "RECALLDOCK_RELEASE_TOKEN") {
 		t.Fatalf("message = %q", got)
+	}
+}
+
+// TestUpdateInstructionsUseExistingCommandPath pins the rebuild command to a
+// directory that exists in this repository.
+//
+// The guidance previously said ./cmd/engram, a path inherited from the upstream
+// baseline. Following it fails outright with "no Go files", which is worse than
+// saying nothing when an operator is already recovering from a broken install.
+// This asserts the module path rather than the string alone, so renaming the
+// command package without updating the guidance fails here.
+func TestUpdateInstructionsUseExistingCommandPath(t *testing.T) {
+	const want = "./cmd/recalldock"
+	for _, root := range []string{"", "/tmp/some root"} {
+		if root == "" {
+			t.Setenv("RECALLDOCK_SOURCE_ROOT", "")
+		} else {
+			t.Setenv("RECALLDOCK_SOURCE_ROOT", root)
+		}
+		got := updateInstructions()
+		if !strings.Contains(got, want) {
+			t.Fatalf("update instructions with RECALLDOCK_SOURCE_ROOT=%q do not mention %s:\n%s", root, want, got)
+		}
+		if strings.Contains(got, "./cmd/engram") {
+			t.Fatalf("update instructions still point at ./cmd/engram:\n%s", got)
+		}
+	}
+}
+
+// TestUpdateInstructionsCommandPathExists fails when the guidance names a
+// directory this checkout does not actually contain.
+func TestUpdateInstructionsCommandPathExists(t *testing.T) {
+	// internal/version -> repository root
+	root := filepath.Join("..", "..")
+	for _, dir := range []string{"cmd/recalldock"} {
+		info, err := os.Stat(filepath.Join(root, dir))
+		if err != nil || !info.IsDir() {
+			t.Fatalf("update instructions reference %q, which is not a directory in this checkout: %v", dir, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "cmd", "engram")); err == nil {
+		t.Fatal("cmd/engram exists again; re-check which command package is authoritative")
 	}
 }

@@ -760,35 +760,99 @@ func TestManagerStopWaitsGoroutine(t *testing.T) {
 	}
 }
 
+// TestManagerRunPanicRecovery proves Run's goroutine survives a panic inside a
+// cycle, records it as PhaseBackoff/internal_error, and keeps running.
+//
+// The poll loop is excluded structurally rather than by timing: PollInterval is
+// an hour, so the ticker cannot fire before this test ends. A shorter interval
+// (the earlier fix used 30s) only made the race unlikely — a successful poll
+// calls recordSuccess, which resets the phase to healthy and clears the
+// internal_error reason this test waits for. With an hour-long interval no poll
+// cycle can exist to race the assertion, so the test cannot pass by luck and
+// cannot fail because a runner was slow.
+//
+// The panic itself is signalled through a channel, so the test can tell "the
+// panic happened and was recovered" apart from "the cycle never ran".
 func TestManagerRunPanicRecovery(t *testing.T) {
 	ls := newFakeLocalStore()
 	tr := newFakeTransport()
-	panicOnce := int32(1)
+	panicked := make(chan struct{}, 1)
 
 	cfg := DefaultConfig()
 	cfg.DebounceDuration = 10 * time.Millisecond
-	cfg.PollInterval = 10 * time.Millisecond
+	// One hour: not a delay tuned to the assertion, but a guarantee that the
+	// periodic path never executes during this test.
+	cfg.PollInterval = time.Hour
 	cfg.BaseBackoff = 10 * time.Millisecond
 	cfg.MaxBackoff = 100 * time.Millisecond
 
 	mgr := New(ls, tr, cfg)
-	mgr.transport = &panicOnceTransport{delegate: tr, panicOnce: &panicOnce}
+	mgr.transport = &signallingPanicTransport{delegate: tr, panicked: panicked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go mgr.Run(ctx)
-	mgr.NotifyDirty()
+	// Stop joins the Run goroutine, so a late cycle cannot outlive the test.
+	defer mgr.Stop()
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		st := mgr.Status()
-		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	mgr.NotifyDirty()
+	// The panic is triggered by the dirty notification, not by a poll tick.
+	select {
+	case <-panicked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("NotifyDirty did not start a cycle (no panic observed)")
 	}
-	t.Fatalf("expected PhaseBackoff/internal_error after panic, got phase=%q code=%q",
-		mgr.Status().Phase, mgr.Status().ReasonCode)
+
+	// From here the cycle is unwinding; safeRun's deferred recover sets the
+	// state. This wait observes that transition rather than assuming a duration.
+	var st Status
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st = mgr.Status()
+		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if st.Phase != PhaseBackoff {
+		t.Fatalf("panic did not leave the manager in backoff: phase=%q", st.Phase)
+	}
+	if st.ReasonCode != "internal_error" {
+		t.Fatalf("panic reason code = %q, want internal_error", st.ReasonCode)
+	}
+	// The remaining assertions pin that the recovery recorded the panic, not
+	// merely that some backoff state exists.
+	if !strings.Contains(st.ReasonMessage, "panic") {
+		t.Fatalf("reason message %q does not record the panic", st.ReasonMessage)
+	}
+	if st.ConsecutiveFailures != 1 {
+		t.Fatalf("consecutive failures = %d, want 1 after a single panic", st.ConsecutiveFailures)
+	}
+	if st.BackoffUntil == nil {
+		t.Fatal("panic recovery left BackoffUntil unset, so the loop would retry immediately")
+	}
+	// The panic fired inside pull, before the delegate was reached. An empty
+	// store has no pending mutations, so push returns without touching the
+	// transport at all — hence zero push calls too. This pins that the panic is
+	// attributed to the pull half of the cycle.
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 0 {
+		t.Fatalf("push calls = %d, want 0 (no pending mutations in this fixture)", got)
+	}
+	if got := atomic.LoadInt32(&tr.pullCalls); got != 0 {
+		t.Fatalf("delegate pull calls = %d, want 0 (the panic fires before delegating)", got)
+	}
+	// And the goroutine is still alive: Stop must join it without hanging.
+	done := make(chan struct{})
+	go func() {
+		mgr.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run goroutine did not exit after recovering from the panic")
+	}
 }
 
 // ─── StopForUpgrade / ResumeAfterUpgrade (REQ-208) ───────────────────────────
@@ -909,35 +973,57 @@ func TestManagerStopBeforeRun(t *testing.T) {
 	}
 }
 
+// TestManagerPanicSetsBackoff is the manager-level counterpart of
+// TestManagerRunPanicRecovery: the same recovery path, reached by calling a
+// cycle directly rather than by driving Run's select loop.
+//
+// It gets the same poll-race treatment. With the previous 10ms PollInterval the
+// poll ticker ran again right after the panic, the retry succeeded, and
+// recordSuccess reset the phase to healthy — so the assertion saw "healthy"
+// instead of the backoff it was looking for. That is the ticker winning a race,
+// not a recovery defect, and it failed exactly that way on windows-2025.
+//
+// PollInterval is therefore set beyond this test's lifetime so the periodic path
+// cannot run, and the panic is signalled over a channel so "no panic" is
+// distinguishable from "recovered but not yet visible".
 func TestManagerPanicSetsBackoff(t *testing.T) {
 	ls := newFakeLocalStore()
 	tr := newFakeTransport()
-	panicOnce := int32(1)
+	panicked := make(chan struct{}, 1)
 
 	cfg := DefaultConfig()
 	cfg.DebounceDuration = 10 * time.Millisecond
-	cfg.PollInterval = 10 * time.Millisecond
+	cfg.PollInterval = time.Hour
 	cfg.BaseBackoff = 10 * time.Millisecond
 	cfg.MaxBackoff = 100 * time.Millisecond
 
 	mgr := New(ls, tr, cfg)
-	mgr.transport = &panicOnceTransport{delegate: tr, panicOnce: &panicOnce}
+	mgr.transport = &signallingPanicTransport{delegate: tr, panicked: panicked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go mgr.Run(ctx)
-	mgr.NotifyDirty()
+	defer mgr.Stop()
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		st := mgr.Status()
-		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	mgr.NotifyDirty()
+	select {
+	case <-panicked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("NotifyDirty did not start a cycle (no panic observed)")
 	}
-	t.Fatalf("expected PhaseBackoff/internal_error, got phase=%q code=%q",
-		mgr.Status().Phase, mgr.Status().ReasonCode)
+
+	var st Status
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st = mgr.Status()
+		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if st.Phase != PhaseBackoff || st.ReasonCode != "internal_error" {
+		t.Fatalf("expected PhaseBackoff/internal_error, got phase=%q code=%q", st.Phase, st.ReasonCode)
+	}
 }
 
 func TestManagerLoopContinuesAfterPanic(t *testing.T) {
@@ -1416,6 +1502,31 @@ func (p *panicOnceTransport) PushMutations(mutations []MutationEntry) (*PushMuta
 func (p *panicOnceTransport) PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error) {
 	if atomic.CompareAndSwapInt32(p.panicOnce, 1, 0) {
 		panic(fmt.Sprintf("test panic in cycle"))
+	}
+	return p.delegate.PullMutations(sinceSeq, limit)
+}
+
+// signallingPanicTransport panics on the first pull and announces it on a
+// channel. The signal lets a test distinguish "the panic never happened" from
+// "the panic was recovered but the state has not settled yet", which polling a
+// status field alone cannot do without guessing a duration.
+type signallingPanicTransport struct {
+	delegate *fakeCloudTransport
+	panicked chan struct{}
+	once     atomic.Bool
+}
+
+func (p *signallingPanicTransport) PushMutations(mutations []MutationEntry) (*PushMutationsResult, error) {
+	return p.delegate.PushMutations(mutations)
+}
+
+func (p *signallingPanicTransport) PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error) {
+	if p.once.CompareAndSwap(false, true) {
+		select {
+		case p.panicked <- struct{}{}:
+		default:
+		}
+		panic("test panic in cycle")
 	}
 	return p.delegate.PullMutations(sinceSeq, limit)
 }
