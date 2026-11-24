@@ -684,7 +684,10 @@ def main():
     results['ok'] = True
     a.report.parent.mkdir(parents=True, exist_ok=True)
     a.report.write_text(json.dumps(results, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
-    print(json.dumps(results, ensure_ascii=False))
+    # The report file is always UTF-8, but the Windows console code page may not
+    # encode the Chinese paths this test exercises, which would fail the run
+    # after every check had already passed.
+    print(json.dumps(results, ensure_ascii=True))
 
 
 if __name__ == '__main__':
