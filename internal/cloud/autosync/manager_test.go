@@ -767,7 +767,13 @@ func TestManagerRunPanicRecovery(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.DebounceDuration = 10 * time.Millisecond
-	cfg.PollInterval = 10 * time.Millisecond
+	// The poll loop must not run during this test. A successful poll calls
+	// recordSuccess, which resets the phase to healthy and wipes the
+	// internal_error reason the test is waiting for — that race made this test
+	// flaky on slower runners (observed on windows-2025), not the recovery path
+	// itself. Polling stays out of the window by being far longer than the
+	// deadline below; the panic is triggered through NotifyDirty instead.
+	cfg.PollInterval = 30 * time.Second
 	cfg.BaseBackoff = 10 * time.Millisecond
 	cfg.MaxBackoff = 100 * time.Millisecond
 
@@ -779,7 +785,9 @@ func TestManagerRunPanicRecovery(t *testing.T) {
 	go mgr.Run(ctx)
 	mgr.NotifyDirty()
 
-	deadline := time.Now().Add(500 * time.Millisecond)
+	// The deadline covers debounce (10ms) plus cycle time; it is generous so a
+	// loaded CI runner reports the real state rather than a timeout.
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		st := mgr.Status()
 		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
