@@ -25,7 +25,10 @@ func TestPruneMissingRegisteredIdentityProtectsExistingRoots(t *testing.T) {
 	if e = os.Remove(filepath.Join(root, ".recalldock", "root.json")); e != nil {
 		t.Fatal(e)
 	}
-	if e = os.Remove(filepath.Join(root, ".recalldock")); e != nil {
+	// .binding.lock is intentionally left on disk by filelock: the lock path must
+	// stay stable so every acquirer contends for the same inode. Removing the
+	// metadata directory therefore needs RemoveAll, not Remove.
+	if e = os.RemoveAll(filepath.Join(root, ".recalldock")); e != nil {
 		t.Fatal(e)
 	}
 	if e = os.Remove(root); e != nil {

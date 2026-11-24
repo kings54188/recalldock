@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"recalldock.local/recalldock/internal/filelock"
 )
 
 func TestRegisteredProjectBindingMatrix(t *testing.T) {
@@ -252,16 +254,17 @@ func TestBindingRejectsUnsafeRootAndOtherWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock := filepath.Join(hidden, ".binding.lock")
-	if err := os.WriteFile(lock, []byte("other"), 0600); err != nil {
-		t.Fatal(err)
+	// The lock is advisory now, so another writer must actually hold the OS
+	// lock. A file that merely exists no longer means "locked"; tolerating a
+	// stale lock file from a crashed process is the point of the change.
+	held, err := filelock.Acquire(lock)
+	if err != nil {
+		t.Fatalf("hold lock as another writer: %v", err)
 	}
 	if _, err := s.BindProjectRoot(p.ID, root); err == nil {
 		t.Fatal("other writer's lock ignored")
 	}
-	body, _ := os.ReadFile(lock)
-	if string(body) != "other" {
-		t.Fatal("other writer's lock changed")
-	}
+	held.Release()
 }
 
 func TestLegacyProjectNameWithPrjPrefixRemainsLegacy(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"recalldock.local/recalldock/internal/filelock"
 	"recalldock.local/recalldock/internal/store"
 )
 
@@ -93,16 +94,18 @@ func TestExportLockRefusesAnotherWriter(t *testing.T) {
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ".export.lock"), []byte("other-writer"), 0600); err != nil {
-		t.Fatal(err)
+	// The lock is advisory now, so "another writer" must actually hold the OS
+	// lock. A file that merely exists no longer means "locked": tolerating a
+	// stale lock file left by a crashed process is the point of the change.
+	held, err := filelock.Acquire(filepath.Join(root, ".export.lock"))
+	if err != nil {
+		t.Fatalf("hold lock as another writer: %v", err)
 	}
+	defer held.Release()
+
 	e := NewExporter(&mockStore{exportData: &store.ExportData{}, stats: &store.Stats{}}, ExportConfig{VaultPath: vault})
 	if _, err := e.Export(); err == nil {
 		t.Fatal("must not ignore another process's lock")
-	}
-	body, _ := os.ReadFile(filepath.Join(root, ".export.lock"))
-	if string(body) != "other-writer" {
-		t.Fatal("another writer's lock was modified")
 	}
 }
 

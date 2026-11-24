@@ -1,12 +1,14 @@
 package obsidian
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"recalldock.local/recalldock/internal/filelock"
 	"recalldock.local/recalldock/internal/store"
 )
 
@@ -132,11 +134,14 @@ func (e *Exporter) Export() (*ExportResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	lock, err := filelock.Acquire(lockPath)
 	if err != nil {
-		return nil, fmt.Errorf("export lock unavailable (running export or stale lock; inspect before removal): %w", err)
+		if errors.Is(err, filelock.ErrUnavailable) {
+			return nil, fmt.Errorf("export lock unavailable: another export is running against this vault; retry after it exits")
+		}
+		return nil, fmt.Errorf("export lock: %w", err)
 	}
-	defer func() { lock.Close(); os.Remove(lockPath) }()
+	defer lock.Release()
 
 	// ── Read incremental state ────────────────────────────────────────────────
 	if _, err := managedPath(engRoot, filepath.Base(e.stateFilePath())); err != nil {
