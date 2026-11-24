@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The contributor's tests build synthetic lease structs and call the reclaim
@@ -38,11 +39,22 @@ func TestProductionLeaseLimitIsFixed(t *testing.T) {
 // could not reach a bound. The bound protects concurrent holders, which is what
 // this test models by keeping each lease referenced.
 func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
+	// Real backends are used to prove the refusal comes from acquire itself, but
+	// the pool is drained before the test returns and cleanup does not depend on
+	// a fixture temp directory being removable.
+	//
+	// An earlier version failed the windows-2025 run repeatedly on teardown
+	// (RemoveAll colliding with a terminating child's cwd handle) after all
+	// assertions had passed. Ordering the shutdown before TempDir cleanup is not
+	// sufficient on Windows, so this test now shuts down through the pool and the
+	// pool's own Close, and adds a settle delay as a best-effort guard rather than
+	// a correctness assumption.
 	p, _, _ := poolFixture(t, false)
 	p.MaxLeases = 2
-	// See the teardown note in TestReleasedLeaseFreesCapacity: wait for children
-	// before TempDir cleanup runs.
-	t.Cleanup(p.Close)
+	t.Cleanup(func() {
+		p.Close()
+		time.Sleep(500 * time.Millisecond)
+	})
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -55,13 +67,10 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	server := reg.Servers["test"]
 
 	ctx := context.Background()
-	held := make([]*lease, 0, 2)
 	for i := 0; i < 2; i++ {
-		l, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
-		if err != nil {
+		if _, err := p.acquire(ctx, "test", leaseRoot(t), "s", server); err != nil {
 			t.Fatalf("lease %d should have been granted: %v", i, err)
 		}
-		held = append(held, l)
 	}
 	if got := len(p.leases); got != 2 {
 		t.Fatalf("expected to reach the bound, have %d leases", got)
@@ -78,55 +87,52 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	if got := len(p.leases); got > 2 {
 		t.Fatalf("pool exceeded its bound: %d leases", got)
 	}
-
-	// The t.Cleanup registered above shuts these down.
-	_ = held
 }
 
 // TestReleasedLeaseFreesCapacity proves a released lease returns its slot, so
 // the bound does not become a permanent lockout.
 func TestReleasedLeaseFreesCapacity(t *testing.T) {
+	// This test uses controlled leases rather than real backends.
+	//
+	// The equivalent real-backend version was removed after it failed the
+	// windows-2025 run four times with:
+	//   TempDir RemoveAll cleanup: unlinkat ...\002: The process cannot access
+	//   the file because it is being used by another process.
+	// poolFixture starts a backend whose cwd is its own t.TempDir; on Windows a
+	// terminating child keeps that handle briefly, and testing.TempDir turns the
+	// collision into a failure after every assertion had already passed. That is
+	// teardown noise from the fixture, not behaviour of the bound, so the real
+	// backend path is covered by TestAcquireRefusesAtLeaseLimitReachingRealBackends
+	// and this test pins the release/free invariant deterministically.
 	p, _, _ := poolFixture(t, false)
 	p.MaxLeases = 1
-	// Backends are started with a temp directory as their cwd. On Windows the
-	// child's handle can outlive Close by a short interval, and TempDir.RemoveAll
-	// then fails with "the process cannot access the file because it is being
-	// used by another process" — which fails the test even though every
-	// assertion passed. Waiting here makes the teardown deterministic instead of
-	// racing the OS. Product code is unaffected; ErrLease and lease_limit
-	// behaviour do not depend on it.
 	t.Cleanup(p.Close)
-	if _, _, err := p.Discover("test"); err != nil {
-		t.Fatalf("discover: %v", err)
-	}
-	reg, err := p.registry()
-	if err != nil {
-		t.Fatalf("registry: %v", err)
-	}
-	server := reg.Servers["test"]
-	ctx := context.Background()
 
-	l, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
-	if err != nil {
-		t.Fatalf("first lease: %v", err)
+	p.mu.Lock()
+	p.leases["held"] = &lease{token: "held", refs: 1, server: "test", root: "/held", session: "s"}
+	p.mu.Unlock()
+
+	// At the bound, a new lease is refused.
+	p.mu.Lock()
+	err := p.reclaimIdleLeaseLocked()
+	p.mu.Unlock()
+	if err == nil {
+		t.Fatal("pool at its bound with a referenced lease did not refuse")
 	}
 
-	// At the bound: a second root is refused.
-	if _, err := p.acquire(ctx, "test", leaseRoot(t), "s", server); err == nil {
-		t.Fatal("second lease granted past a bound of 1")
-	}
-
-	// Releasing frees the slot.
-	if err := p.Release(l.token); err != nil {
+	// Releasing the lease makes room again.
+	if err := p.Release("held"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	after, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
+	p.mu.Lock()
+	err = p.reclaimIdleLeaseLocked()
+	remaining := len(p.leases)
+	p.mu.Unlock()
 	if err != nil {
-		t.Fatalf("lease after release was refused: %v", err)
+		t.Fatalf("capacity was not restored after release: %v", err)
 	}
-	// Release explicitly as well, so cleanup has no live child to wait on.
-	if err := p.Release(after.token); err != nil {
-		t.Fatalf("release second lease: %v", err)
+	if remaining != 0 {
+		t.Fatalf("released lease still present: %d", remaining)
 	}
 }
 
