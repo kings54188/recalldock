@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"recalldock.local/recalldock/internal/filelock"
 	"recalldock.local/recalldock/internal/opsstore"
 )
 
@@ -127,13 +128,17 @@ func writeRegistry(path string, reg Registry) error {
 }
 
 func (p *Pool) Update(fn func(*Registry) error) error {
-	// Create-only lock fails closed after a crashed writer; never steal by age.
-	lockPath := p.RegistryPath + ".lock"
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	// An OS advisory lock is released by the kernel when the holder dies, so a
+	// crashed gateway cannot wedge later registry writes. The lock file stays on
+	// disk; its existence never means "locked".
+	lock, err := filelock.Acquire(p.RegistryPath + ".lock")
 	if err != nil {
-		return errors.New("registry lock unavailable; inspect before recovery")
+		if errors.Is(err, filelock.ErrUnavailable) {
+			return errors.New("registry lock unavailable; another recalldock process is updating it")
+		}
+		return err
 	}
-	defer func() { lock.Close(); os.Remove(lockPath) }()
+	defer lock.Release()
 	reg, err := p.registry()
 	if err != nil {
 		return err

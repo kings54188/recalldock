@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"recalldock.local/recalldock/internal/filelock"
 	"recalldock.local/recalldock/internal/memorypolicy"
 	"regexp"
 	"runtime"
@@ -228,11 +229,14 @@ func Save(root, lane string, expected int64, cp Checkpoint) (int64, error) {
 		return 0, err
 	}
 	lockPath := filepath.Join(filepath.Dir(path), ".checkpoint.lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	lock, err := filelock.Acquire(lockPath)
 	if err != nil {
-		return 0, fmt.Errorf("checkpoint lock unavailable; inspect before recovery: %w", err)
+		if errors.Is(err, filelock.ErrUnavailable) {
+			return 0, fmt.Errorf("checkpoint lock unavailable: another process is writing this task lane; retry after it exits")
+		}
+		return 0, fmt.Errorf("checkpoint lock: %w", err)
 	}
-	defer func() { lock.Close(); os.Remove(lockPath) }()
+	defer lock.Release()
 	generation := int64(0)
 	f, err := openCheckpoint(path)
 	if err == nil {

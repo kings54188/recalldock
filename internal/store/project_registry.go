@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	projectpkg "recalldock.local/recalldock/internal/project"
+	"recalldock.local/recalldock/internal/filelock"
 )
 
 var ErrUnknownRegisteredProject = errors.New("unknown registered project")
@@ -199,11 +200,14 @@ func (s *Store) BindProjectRoot(id, root string) (ProjectBinding, error) {
 		return ProjectBinding{}, err
 	}
 	lockPath := filepath.Join(hidden, ".binding.lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	lock, err := filelock.Acquire(lockPath)
 	if err != nil {
+		if errors.Is(err, filelock.ErrUnavailable) {
+			return ProjectBinding{}, fmt.Errorf("binding lock unavailable: another process is binding this root; retry after it exits")
+		}
 		return ProjectBinding{}, fmt.Errorf("binding lock: %w", err)
 	}
-	defer func() { lock.Close(); os.Remove(lockPath) }()
+	defer lock.Release()
 	identity, err := s.Identity()
 	if err != nil {
 		return ProjectBinding{}, err
