@@ -973,35 +973,57 @@ func TestManagerStopBeforeRun(t *testing.T) {
 	}
 }
 
+// TestManagerPanicSetsBackoff is the manager-level counterpart of
+// TestManagerRunPanicRecovery: the same recovery path, reached by calling a
+// cycle directly rather than by driving Run's select loop.
+//
+// It gets the same poll-race treatment. With the previous 10ms PollInterval the
+// poll ticker ran again right after the panic, the retry succeeded, and
+// recordSuccess reset the phase to healthy — so the assertion saw "healthy"
+// instead of the backoff it was looking for. That is the ticker winning a race,
+// not a recovery defect, and it failed exactly that way on windows-2025.
+//
+// PollInterval is therefore set beyond this test's lifetime so the periodic path
+// cannot run, and the panic is signalled over a channel so "no panic" is
+// distinguishable from "recovered but not yet visible".
 func TestManagerPanicSetsBackoff(t *testing.T) {
 	ls := newFakeLocalStore()
 	tr := newFakeTransport()
-	panicOnce := int32(1)
+	panicked := make(chan struct{}, 1)
 
 	cfg := DefaultConfig()
 	cfg.DebounceDuration = 10 * time.Millisecond
-	cfg.PollInterval = 10 * time.Millisecond
+	cfg.PollInterval = time.Hour
 	cfg.BaseBackoff = 10 * time.Millisecond
 	cfg.MaxBackoff = 100 * time.Millisecond
 
 	mgr := New(ls, tr, cfg)
-	mgr.transport = &panicOnceTransport{delegate: tr, panicOnce: &panicOnce}
+	mgr.transport = &signallingPanicTransport{delegate: tr, panicked: panicked}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go mgr.Run(ctx)
-	mgr.NotifyDirty()
+	defer mgr.Stop()
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		st := mgr.Status()
-		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	mgr.NotifyDirty()
+	select {
+	case <-panicked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("NotifyDirty did not start a cycle (no panic observed)")
 	}
-	t.Fatalf("expected PhaseBackoff/internal_error, got phase=%q code=%q",
-		mgr.Status().Phase, mgr.Status().ReasonCode)
+
+	var st Status
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st = mgr.Status()
+		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if st.Phase != PhaseBackoff || st.ReasonCode != "internal_error" {
+		t.Fatalf("expected PhaseBackoff/internal_error, got phase=%q code=%q", st.Phase, st.ReasonCode)
+	}
 }
 
 func TestManagerLoopContinuesAfterPanic(t *testing.T) {
