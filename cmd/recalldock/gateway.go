@@ -73,7 +73,7 @@ func runGateway(args []string) (err error) {
 		"doctor":   "--registry",
 		"add":      "--registry --server --input --source-file --format --keys --description --host --enable --stateful",
 		"discover": "--registry --server",
-		"grant":    "--registry --server --tool --root --read-only --arguments --session --expires",
+		"grant":    "--registry --server --tool --root --read-only --recursive --arguments --session --expires",
 		"revoke":   "--registry --server --tool",
 		"enable":   "--registry --server",
 		"disable":  "--registry --server",
@@ -86,7 +86,7 @@ func runGateway(args []string) (err error) {
 	var valueFlags, boolFlags []string
 	for _, key := range strings.Fields(allowed) {
 		switch key {
-		case "--read-only", "--enable", "--stateful", "--json":
+		case "--read-only", "--recursive", "--enable", "--stateful", "--json":
 			boolFlags = append(boolFlags, key)
 		default:
 			valueFlags = append(valueFlags, key)
@@ -282,7 +282,7 @@ func runGateway(args []string) (err error) {
 				return err
 			}
 		}
-		grant, err := pool.Grant(id, gateway.GrantOptions{Tool: values["--tool"], ReadOnly: flags["--read-only"], Roots: []string{values["--root"]}, Arguments: arguments, Session: values["--session"], ExpiresAt: values["--expires"]})
+		grant, err := pool.Grant(id, gateway.GrantOptions{Tool: values["--tool"], ReadOnly: flags["--read-only"], Recursive: flags["--recursive"], Roots: []string{values["--root"]}, Arguments: arguments, Session: values["--session"], ExpiresAt: values["--expires"]})
 		if err != nil {
 			return err
 		}
