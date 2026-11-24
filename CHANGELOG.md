@@ -4,6 +4,15 @@
 
 版本以 annotated tag 与不可变平台包（Linux x64 `.tar.gz` 与 Windows x64 `.zip`）交付：每个正式版本从干净提交构建，包内附 `release.json` 与 SHA256 校验；安装、备份与回滚说明见 [docs/INSTALLATION.md](docs/INSTALLATION.md)、[docs/WINDOWS.md](docs/WINDOWS.md) 与 [docs/RELEASE.md](docs/RELEASE.md)。破坏性变更在对应版本条目中显式标注迁移路径。
 
+## 0.3.25 — 2026-11-24（Windows DSH 安装适配与 FTS 迁移可靠性修复）
+
+- **fix(store):** `migrateFTSTopicKey` 的“是否已完成”判据此前只检查 FTS 索引是否带有 `topic_key` 列。若重建在 `CREATE VIRTUAL TABLE` 之后、回填 `INSERT` 与三个触发器之前中断，该判据即判定完成，于是写操作不再进入索引、检索静默漏数据且不报错。SQLite 不会把多语句 `Exec` 视为原子（实测中途失败时先执行的 `DROP TABLE` 已提交），因此半迁移状态无法被下一次运行修复。判据现要求 `topic_key` 列 **且** 三个同步触发器齐全，重建本身包在单个事务内，失败不会提交已执行的 DDL，可安全重试。行数一致性被明确排除在外：该索引是 external-content 投影，软删除会合理保留已索引行，若以 `indexed == live` 为判据会在每次打开时重建整个索引。
+- **test(store):** FTS 迁移回归测试改用 `MATCH` 断言真实检索，不再以 `COUNT(*)` 作为索引正确性的证据。`observations_fts` 是 FTS5 external-content 表，倒排索引为空时 `COUNT(*)` 仍会回退到主表返回看似正常的行数（实测 `observations=2, fts COUNT(*)=2, fts MATCH 'alpha'=0`），旧的计数断言在检索完全失效时依然会通过。新增覆盖：旧结构升级后已有记录可检索、半迁移（新列但空倒排索引/无触发器）修复后可检索、注入失败回滚后旧索引仍可检索、失败重试后可检索、新增记录经触发器进入索引、更新后旧词失效新词命中、删除清除词条、已完成库重复打开不重建、软删除行不被误判为未完成。修复前用列判据运行会报 `retrieval broken: ... matched 0 rows through FTS MATCH`。
+- **feat(install/windows):** Windows 安装器 `tools/install-windows.ps1` 支持 `-Hosts dsh`。此前该分支只输出“未验证”提示并跳过配置写入，导致 Windows 用户装完后在 DSH 中看不到任何工具。现与 Linux 安装器行为对齐：只拥有标记之间的受管块，升级时仅改写该块中唯一一行 `command`，块外存在同名未受管入口或不配对标记时拒绝写入，重复安装幂等；路径按 YAML 双引号规则显式转义，不依赖 PowerShell 版本的 `ConvertTo-Json` 行为，支持中文与含空格路径。
+- **test(ci/windows):** `tools/verify-windows.py` 新增隔离 `USERPROFILE` 的 DSH 套件，覆盖全新安装、保留既有补丁、升级、幂等、回滚、未受管冲突与畸形标记拒绝，并以受管块声明的确切命令完成 MCP 握手、固定七工具、Work CAS 读写回读，以及记忆后端发现。报告显式标注 `live_dsh_host_session: NOT ASSESSED`。
+- **docs(dsh):** 记录 Windows 平台的真实验收边界：第三方已在 Windows 11 x64 + DSH `0.2.0-rc.2` 上完成宿主加载与基础 MCP 验证；`windows-2025` CI 验证了安装配置、七工具协议、Work CAS 与基础记忆功能；真实 Windows DSH 会话中的长期记忆自动晋升、父子 Work writer 身份分离以及桌面 GUI 工作流**尚未评估**，CI 的协议测试不构成完整宿主端到端验收。
+- **docs(gateway):** 澄清默认 `agent` 信任模式的安全边界：它不检查逐工具 grant，且接受调用方提供的任意绝对 `root`；但仍强制后端 `enabled`、宿主绑定、目录发现、live schema 与绝对路径校验。授权面因此收敛为“谁能启动网关、谁决定启用哪些后端”，需要逐工具最小权限时须显式 `--trust strict`。模式本身未改变。
+
 ## 0.3.24 — 2026-11-23（首个正式公开发行版本 + 原生 Windows x64 支持）
 
 - **feat(windows):** 新增原生 Windows x64 (`windows/amd64`) 支持（纯 Go 零 CGO，无需 WSL2 或管理员权限）：默认数据目录 `%LOCALAPPDATA%\RecallDock`（与 WSL2 `~/.recalldock` 隔离）、Windows 卷序列号/文件索引目录身份与 reparse-point 防护 (`directory_identity_windows.go`、`identity_windows.go`、`candidate_file_open_windows.go`)、Windows 8.3 短路径规范化 (`NormalizeWindowsShortPath`、`expandOpsShortPath`)、进程组隔离 (`process_windows.go`)、独占锁项目识别 (`host_project_windows.go`)、路径大小写不敏感与 UNC 路径拒绝、PowerShell 交互/无交互安装与受保护回滚 (`tools/install-windows.ps1`)、Windows ZIP 打包 (`tools/build-release-windows.py`) 及 Windows 验证脚本 (`tools/verify-windows.py`)。
