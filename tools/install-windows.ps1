@@ -33,10 +33,10 @@ function Show-Usage {
 RecallDock Windows Local Setup
 
 Guided Interactive Install (recommended):
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install-windows.ps1 -Interactive [-Hosts codex,claude-code,antigravity]
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install-windows.ps1 -Interactive [-Hosts codex,claude-code,antigravity,dsh]
 
 Preview JSON (non-interactive):
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install-windows.ps1 [-Release C:\path\to\release] [-Hosts codex,claude-code,antigravity]
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install-windows.ps1 [-Release C:\path\to\release] -Hosts codex,claude-code,antigravity,dsh]
 
 Apply (non-interactive):
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\install-windows.ps1 -Release C:\path\to\release -Hosts codex,claude-code -Apply -ExpectedSha256 <SHA256> -BackupDir C:\path\to\new-backup
@@ -254,6 +254,71 @@ function Update-ClaudeGatewayJson([string]$ExistingText, [string]$CommandPath) {
     return ($obj | ConvertTo-Json -Depth 16) + "`n"
 }
 
+function Update-DshCordisPatch([string]$ExistingText, [string]$CommandPath) {
+    # Mirrors tools/install-local.py: only the managed block between the two
+    # markers is owned by RecallDock. Everything outside it (bundles, other
+    # patches, auth) is preserved byte for byte.
+    $begin = '# BEGIN RECALLDOCK GATEWAY'
+    $end = '# END RECALLDOCK GATEWAY'
+    $text = if ([string]::IsNullOrEmpty($ExistingText)) { "[]`n" } else { $ExistingText }
+
+    $beginCount = ([regex]::Matches($text, [regex]::Escape($begin))).Count
+    $endCount = ([regex]::Matches($text, [regex]::Escape($end))).Count
+    if ($beginCount -ne $endCount -or $beginCount -gt 1) {
+        Fail "malformed managed DSH block in cordis.patch.yml: marker counts begin=$beginCount end=$endCount"
+    }
+
+    # The command travels through YAML double-quoted style. Escaping is done
+    # explicitly rather than via ConvertTo-Json so the result does not depend on
+    # how a particular PowerShell version serialises strings: backslash and
+    # double quote are the only characters a Windows path needs, and every other
+    # character (including non-ASCII user names) is valid literal UTF-8 YAML.
+    $escapedCommand = $CommandPath.Replace('\', '\\').Replace('"', '\"')
+    $quotedCommand = '"' + $escapedCommand + '"'
+    $block = @(
+        $begin
+        '- insert:'
+        '  - id: mcp-recalldock-gateway'
+        '    name: "@deepseek-ai/dsh-mcp-client"'
+        '    config:'
+        '      serverName: recalldock_gateway'
+        '      transport: stdio'
+        "      command: $quotedCommand"
+        '      args: [gateway, serve, --host, dsh]'
+        '      failOnStartupError: true'
+        $end
+    ) -join "`n"
+
+    if ($beginCount -eq 1) {
+        $start = $text.IndexOf($begin)
+        $stop = $text.IndexOf($end) + $end.Length
+        if ($stop -le $start) {
+            Fail "malformed managed DSH block ordering in cordis.patch.yml"
+        }
+        $outside = $text.Substring(0, $start) + $text.Substring($stop)
+        if ($outside -match '(?m)\bid:\s*[''"]?mcp-recalldock-gateway\b') {
+            Fail "unmanaged DSH gateway entry exists outside the managed block; preserve and migrate explicitly"
+        }
+        $currentBlock = $text.Substring($start, $stop - $start)
+        $commandLine = [regex]'(?m)^([ \t]+command:)[^\n]*$'
+        $matches = $commandLine.Matches($currentBlock)
+        if ($matches.Count -ne 1) {
+            Fail "managed DSH block must contain exactly one runtime command line"
+        }
+        $match = $matches[0]
+        $updatedLine = $match.Groups[1].Value + ' ' + $quotedCommand
+        $updatedBlock = $currentBlock.Substring(0, $match.Index) + $updatedLine +
+            $currentBlock.Substring($match.Index + $match.Length)
+        return $text.Substring(0, $start) + $updatedBlock + $text.Substring($stop)
+    }
+
+    if ($text -match '(?m)\bid:\s*[''"]?mcp-recalldock-gateway\b') {
+        Fail "unmanaged DSH gateway entry exists; preserve and migrate explicitly"
+    }
+    $trimmed = if ($text.Trim() -eq '[]') { '' } else { $text.TrimEnd("`r", "`n") + "`n" }
+    return $trimmed + $block + "`n"
+}
+
 function Write-BytesAtomic([string]$TargetPath, [byte[]]$Bytes) {
     $parent = Split-Path -Parent $TargetPath
     if (-not (Test-Path -LiteralPath $parent)) {
@@ -390,6 +455,7 @@ if ($Interactive -and $Hosts.Count -eq 0) {
     if (Test-Path -LiteralPath (Join-Path $userProfile '.codex') -PathType Container) { $selectedHosts += 'codex' }
     if ((Test-Path -LiteralPath (Join-Path $userProfile '.claude')) -or (Test-Path -LiteralPath (Join-Path $userProfile '.claude.json'))) { $selectedHosts += 'claude-code' }
     if ((Test-Path -LiteralPath (Join-Path $userProfile '.gemini') -PathType Container) -or (Get-Command agy -ErrorAction SilentlyContinue)) { $selectedHosts += 'antigravity' }
+    if (Test-Path -LiteralPath (Join-Path $userProfile '.dsh') -PathType Container) { $selectedHosts += 'dsh' }
 }
 foreach ($h in $Hosts) {
     foreach ($part in ($h -split ',')) {
@@ -459,7 +525,13 @@ foreach ($h in $selectedHosts) {
             $notes += "Antigravity uses its native plugin manager: agy plugin validate `"$agDir`" --strict --json && agy plugin install `"$agDir`". Remember to ensure installed bin dir `"$(Join-Path $InstallRoot 'bin')`" is on user PATH or configure absolute command path."
         }
         'dsh' {
-            $notes += 'Windows native DSH integration is not verified in this release; skipped automated DSH config edits.'
+            # Only the managed block between the RecallDock markers is touched;
+            # bundles, other patches and auth stay exactly as they were.
+            $dshPatch = Join-Path $userProfile '.dsh\cordis.patch.yml'
+            $curState = Get-FileState $dshPatch
+            $curText = if ($curState.bytes) { $Utf8NoBom.GetString($curState.bytes) } else { '' }
+            $nextText = Update-DshCordisPatch $curText $installedExe
+            Add-PlannedFile $dshPatch ($Utf8NoBom.GetBytes($nextText)) $false
         }
     }
 }

@@ -2834,14 +2834,32 @@ func normalizeUpgradeRepairClass(class string) string {
 	}
 }
 
+// migrateFTSTopicKey rebuilds the observations FTS index so it carries the
+// topic_key column and the three synchronisation triggers.
+//
+// The rebuild must be idempotent and resumable: an interrupted run may leave
+// the index with the new column layout but no rows and no triggers, because
+// SQLite does not make a multi-statement Exec atomic and DDL committed before a
+// later failure stays applied. The completion probe therefore checks the whole
+// finished shape (column, all three triggers, row parity) rather than only the
+// column, and the rebuild itself runs in one transaction so a failure cannot
+// commit the drops.
 func (s *Store) migrateFTSTopicKey() error {
-	var colCount int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM pragma_table_xinfo('observations_fts') WHERE name = 'topic_key'").Scan(&colCount)
-	if err != nil || colCount > 0 {
+	done, err := s.ftsTopicKeyMigrationComplete()
+	if err != nil {
+		return err
+	}
+	if done {
 		return nil
 	}
 
-	if _, err := s.execHook(s.db, `
+	tx, err := s.beginTxHook()
+	if err != nil {
+		return fmt.Errorf("migrate fts topic_key: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := s.execHook(tx, `
 		DROP TRIGGER IF EXISTS obs_fts_insert;
 		DROP TRIGGER IF EXISTS obs_fts_update;
 		DROP TRIGGER IF EXISTS obs_fts_delete;
@@ -2880,7 +2898,34 @@ func (s *Store) migrateFTSTopicKey() error {
 	`); err != nil {
 		return fmt.Errorf("migrate fts topic_key: %w", err)
 	}
+	if err := s.commitHook(tx); err != nil {
+		return fmt.Errorf("migrate fts topic_key: commit: %w", err)
+	}
 	return nil
+}
+
+// ftsTopicKeyMigrationComplete reports whether the observations FTS index is in
+// its finished post-migration shape: the topic_key column plus all three
+// synchronisation triggers.
+//
+// Row-count parity is deliberately not part of this check. The index is an
+// external-content projection maintained by triggers, and a soft delete keeps
+// the row in the index while removing it from the live set, so `indexed == live`
+// is false after any soft delete and would force a full rebuild on every open.
+// Structural completeness is what distinguishes a finished migration from an
+// interrupted one; index drift caused by a lost trigger is repaired below.
+func (s *Store) ftsTopicKeyMigrationComplete() (bool, error) {
+	var tables, columns, triggers int
+	if err := s.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='observations_fts'),
+			(SELECT COUNT(*) FROM pragma_table_xinfo('observations_fts') WHERE name='topic_key'),
+			(SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN
+				('obs_fts_insert','obs_fts_update','obs_fts_delete'))
+	`).Scan(&tables, &columns, &triggers); err != nil {
+		return false, fmt.Errorf("migrate fts topic_key: probe: %w", err)
+	}
+	return tables > 0 && columns > 0 && triggers == 3, nil
 }
 
 // ─── Sessions ────────────────────────────────────────────────────────────────

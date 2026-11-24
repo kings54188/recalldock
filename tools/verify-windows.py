@@ -76,6 +76,278 @@ def mcp_roundtrip(exe: Path, args: list[str], cwd: Path, env: dict[str, str], ca
     return parsed
 
 
+def parse_managed_dsh_block(text: str) -> dict:
+    """Parse the RecallDock managed block without a YAML dependency.
+
+    The block is a fixed, RecallDock-written shape, so asserting it directly is
+    more precise than a general YAML parse: it pins the exact keys and order a
+    real DSH client reads. Everything outside the markers is checked separately
+    by comparing the caller's expected text.
+    """
+    begin = '# BEGIN RECALLDOCK GATEWAY'
+    end = '# END RECALLDOCK GATEWAY'
+    assert text.count(begin) == 1, f'expected exactly one {begin} marker'
+    assert text.count(end) == 1, f'expected exactly one {end} marker'
+    start = text.index(begin) + len(begin)
+    stop = text.index(end)
+    lines = [ln.rstrip() for ln in text[start:stop].splitlines() if ln.strip()]
+    expected_keys = [
+        '- insert:',
+        '  - id: mcp-recalldock-gateway',
+        '    name: "@deepseek-ai/dsh-mcp-client"',
+        '    config:',
+        '      serverName: recalldock_gateway',
+        '      transport: stdio',
+    ]
+    assert lines[:len(expected_keys)] == expected_keys, lines[:len(expected_keys)]
+    rest = lines[len(expected_keys):]
+    assert len(rest) == 3, rest
+    command_line, args_line, fail_line = rest
+    assert command_line.startswith('      command: "'), command_line
+    assert command_line.endswith('"'), command_line
+    assert args_line == '      args: [gateway, serve, --host, dsh]', args_line
+    assert fail_line == '      failOnStartupError: true', fail_line
+    # Undo YAML double-quoted escaping: \\ and \" are the only escapes written.
+    raw = command_line[len('      command: "'):-1]
+    command = raw.replace('\\"', '"').replace('\\\\', '\\')
+    return {'command': command, 'args': ['gateway', 'serve', '--host', 'dsh'], 'raw': command_line}
+
+
+def run_dsh_installer_checks(tmp: Path, rel_dir: Path, manifest: dict, exe: Path, base_env: dict) -> dict:
+    """Exercise the Windows DSH managed block against an isolated USERPROFILE.
+
+    Every run uses a throwaway USERPROFILE and LOCALAPPDATA, so the test never
+    touches a real `~/.dsh`. Each assertion is recorded by name so the report
+    distinguishes configuration-format compatibility from a live DSH session,
+    which this test cannot assess.
+    """
+
+    ps1 = rel_dir / 'tools' / 'install-windows.ps1'
+    assert ps1.is_file(), 'release is missing tools/install-windows.ps1'
+
+    checked: list[str] = []
+    # A dedicated home keeps the DSH test independent of the earlier hosts.
+    home = tmp / 'dsh 用户 主目录' / 'File User'
+    local_app = home / 'AppData' / 'Local'
+    home.mkdir(parents=True)
+    local_app.mkdir(parents=True)
+    env = clean_env(home, local_app)
+    env['DSH_HOME'] = str(home / '.dsh')
+
+    def powershell(*args: str, check: bool = True):
+        return subprocess.run(
+            ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(ps1), *args],
+            env=env, capture_output=True, text=True, encoding='utf-8', timeout=120, check=check,
+        )
+
+    def preview():
+        return json.loads(powershell('-Release', str(rel_dir), '-Hosts', 'dsh').stdout)
+
+    dsh_dir = home / '.dsh'
+    patch_path = dsh_dir / 'cordis.patch.yml'
+    installed_exe = local_app / 'RecallDock' / 'bin' / 'recalldock.exe'
+
+    # Pre-existing user content that must survive every write.
+    dsh_dir.mkdir(parents=True)
+    preexisting = (
+        '- id: user-plugin\n'
+        '  name: "@local/user-plugin"\n'
+        '  config:\n'
+        '    enabled: true\n'
+        '\n'
+        '- id: user-theme\n'
+        '  name: "@deepseek-ai/dsh-client-ui-theme"\n'
+    )
+    patch_path.write_text(preexisting, encoding='utf-8', newline='\n')
+
+    # 1. Fresh install into a profile that already has unrelated patches.
+    plan = preview()
+    assert any(f['path'].endswith('cordis.patch.yml') for f in plan['files']), plan
+    backup = tmp / 'dsh-backup-1'
+    powershell('-Release', str(rel_dir), '-Hosts', 'dsh', '-Apply',
+               '-ExpectedSha256', plan['plan_sha256'], '-BackupDir', str(backup))
+    assert installed_exe.is_file(), 'installed exe missing after apply'
+
+    text = patch_path.read_text(encoding='utf-8')
+    assert text.count('# BEGIN RECALLDOCK GATEWAY') == 1, text
+    assert text.count('# END RECALLDOCK GATEWAY') == 1, text
+    assert preexisting.strip() in text, 'pre-existing patches were dropped'
+    assert text.startswith(preexisting.rstrip('\n')), 'existing patches were not kept verbatim'
+    managed = parse_managed_dsh_block(text)
+    assert managed['command'] == str(installed_exe), managed
+    checked.append('fresh_install_preserves_existing_patches')
+    checked.append('managed_block_schema_and_windows_absolute_path')
+
+    # The path contains a space and non-ASCII characters; both must survive a
+    # YAML round trip as a single literal Windows path.
+    assert ' ' in str(installed_exe), 'expected a path with a space'
+    assert '\u7528\u6237' in str(installed_exe), 'expected a non-ASCII path'
+    checked.append('space_and_chinese_path_roundtrip')
+
+    # 2. Repeat install is idempotent: the preview offers no file change.
+    second = preview()
+    assert second['files'] == [], second
+    checked.append('repeat_install_idempotent')
+
+    # 3. Upgrade: move the managed command to a new install root.
+    moved_root = tmp / 'upgrade 目录' / 'RecallDock2'
+    moved_exe = moved_root / 'bin' / 'recalldock.exe'
+    moved_exe.parent.mkdir(parents=True)
+    moved_exe.write_bytes(exe.read_bytes())
+    upgrade_plan = json.loads(powershell(
+        '-Release', str(rel_dir), '-Hosts', 'dsh', '-InstallRoot', str(moved_root)).stdout)
+    backup_up = tmp / 'dsh-backup-upgrade'
+    powershell('-Release', str(rel_dir), '-Hosts', 'dsh', '-InstallRoot', str(moved_root),
+               '-Apply', '-ExpectedSha256', upgrade_plan['plan_sha256'], '-BackupDir', str(backup_up))
+    upgraded_text = patch_path.read_text(encoding='utf-8')
+    up_managed = parse_managed_dsh_block(upgraded_text)
+    assert up_managed['command'] == str(moved_exe), up_managed
+    assert up_managed['args'] == ['gateway', 'serve', '--host', 'dsh'], up_managed
+    assert upgraded_text.startswith(preexisting.rstrip('\n')), 'upgrade dropped user patches'
+    assert patch_path.read_text(encoding='utf-8').count('# BEGIN RECALLDOCK GATEWAY') == 1
+    checked.append('upgrade_rewrites_only_managed_command')
+
+    # 4. Rollback restores the exact pre-install bytes and keeps user content.
+    powershell('-Rollback', '-BackupDir', str(backup_up))
+    restored = patch_path.read_text(encoding='utf-8')
+    rb_managed = parse_managed_dsh_block(restored)
+    assert rb_managed['command'] == str(installed_exe), rb_managed
+    checked.append('rollback_restores_managed_block')
+
+    # 5. Unmanaged conflict: a same-id entry outside the managed block must be
+    # refused rather than silently overwritten.
+    conflict = (
+        '- id: mcp-recalldock-gateway\n'
+        '  name: "@deepseek-ai/dsh-mcp-client"\n'
+        '  config:\n'
+        '    serverName: rogue\n'
+    )
+    patch_path.write_text(conflict, encoding='utf-8')
+    refused = powershell('-Release', str(rel_dir), '-Hosts', 'dsh', check=False)
+    assert refused.returncode != 0, 'unmanaged same-id entry was not refused'
+    assert patch_path.read_text(encoding='utf-8') == conflict, 'refused install still rewrote the file'
+    checked.append('unmanaged_conflict_refused_without_write')
+
+    # 6. Malformed managed block: unbalanced markers must fail closed.
+    malformed = '- id: other\n  name: "@local/other"\n# BEGIN RECALLDOCK GATEWAY\n- insert:\n'
+    patch_path.write_text(malformed, encoding='utf-8')
+    refused2 = powershell('-Release', str(rel_dir), '-Hosts', 'dsh', check=False)
+    assert refused2.returncode != 0, 'unbalanced managed markers were not refused'
+    assert patch_path.read_text(encoding='utf-8') == malformed, 'malformed file was rewritten'
+    checked.append('malformed_managed_block_refused')
+
+    # Restore a good managed block for the handshake checks below.
+    patch_path.write_text(preexisting, encoding='utf-8')
+    restore_plan = preview()
+    powershell('-Release', str(rel_dir), '-Hosts', 'dsh', '-Apply',
+               '-ExpectedSha256', restore_plan['plan_sha256'], '-BackupDir', str(tmp / 'dsh-backup-restore'))
+    final_managed = parse_managed_dsh_block(patch_path.read_text(encoding='utf-8'))
+    gateway_command = Path(final_managed['command'])
+    assert gateway_command.is_file(), gateway_command
+
+    # 7. Launch the command the managed block declares and complete a real MCP
+    # handshake, proving the configuration points at a working runtime.
+    session = mcp_roundtrip(
+        gateway_command, ['gateway', 'serve', '--host', 'dsh'], home,
+        clean_env(home, local_app, dsh_dir / 'data'),
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'verify-windows', 'version': '0'}}},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+        ],
+    )
+    init = session[1]
+    assert 'result' in init, init
+    assert init['result']['protocolVersion'], init
+    tools = session[2]['result']['tools']
+    names = sorted(t['name'] for t in tools)
+    assert names == sorted([
+        'tools_find', 'tools_describe', 'tools_call', 'tools_release',
+        'work_find', 'work_read', 'work_checkpoint',
+    ]), names
+    checked.append('dsh_declared_command_mcp_handshake')
+    checked.append('fixed_seven_tool_surface')
+
+    # 8. Work checkpoint / CAS through the same seven-tool surface the DSH
+    # managed block exposes. work_write is not part of the gateway surface, so
+    # the checkpoint is created by the CLI and then read and CAS-retried through
+    # the MCP tools, which is the path a DSH agent actually uses.
+    ops_data = dsh_dir / 'data'
+    work_root = home / 'work 项目 甲'
+    work_root.mkdir(parents=True, exist_ok=True)
+    work_env = clean_env(home, local_app, ops_data)
+    cp_input = tmp / 'dsh-work-checkpoint.json'
+    cp_input.write_text(json.dumps(
+        {'goal': 'DSH native Windows Work CAS probe', 'summary': 'initial'}), encoding='utf-8')
+    created = subprocess.run(
+        [str(exe), 'work', 'checkpoint', '--root', str(work_root), '--lane', 'dsh-lane',
+         '--expected', '0', '--input', str(cp_input)],
+        cwd=str(tmp), env=work_env, capture_output=True, text=True, encoding='utf-8', timeout=60,
+    )
+    assert created.returncode == 0, created.stderr[:800]
+
+    work_session = mcp_roundtrip(
+        gateway_command, ['gateway', 'serve', '--host', 'dsh'], home,
+        clean_env(home, local_app, ops_data),
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'verify-windows', 'version': '0'}}},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+                'name': 'work_read', 'arguments': {'root': str(work_root), 'lane': 'dsh-lane', 'mode': 'l1'}}},
+            {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
+                'name': 'work_checkpoint', 'arguments': {
+                    'root': str(work_root), 'lane': 'dsh-lane', 'expected': 1,
+                    'checkpoint': {'goal': 'DSH native Windows Work CAS probe', 'summary': 'updated'}}}},
+            {'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {
+                'name': 'work_read', 'arguments': {'root': str(work_root), 'lane': 'dsh-lane', 'mode': 'l1'}}},
+        ],
+    )
+    for req_id, label in ((2, 'initial read'), (3, 'checkpoint write'), (4, 'readback')):
+        payload = work_session[req_id]
+        assert 'result' in payload, f'{label}: {payload}'
+        assert not payload['result'].get('isError'), f'{label} failed: {payload["result"]}'
+    readback = json.dumps(work_session[4]['result'], ensure_ascii=False)
+    assert 'updated' in readback, f'checkpoint write not visible on readback: {readback[:400]}'
+
+    # A stale expected generation must be refused, which is the CAS guarantee.
+    stale = mcp_roundtrip(
+        gateway_command, ['gateway', 'serve', '--host', 'dsh'], home,
+        clean_env(home, local_app, ops_data),
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'verify-windows', 'version': '0'}}},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+                'name': 'work_checkpoint', 'arguments': {
+                    'root': str(work_root), 'lane': 'dsh-lane', 'expected': 1,
+                    'checkpoint': {'goal': 'stale write must fail', 'summary': 'stale'}}}},
+        ],
+    )
+    stale_result = stale[2]['result']
+    assert stale_result.get('isError'), f'stale CAS write was accepted: {stale_result}'
+    checked.append('work_checkpoint_cas_and_readback')
+
+    # 9. Memory backend discovery through the gateway in the DSH data dir.
+    db_path = ops_data / 'recalldock.db'
+    assert not db_path.exists() or db_path.is_file()
+    mem_data = dsh_dir / 'memdata'
+    mem_env = clean_env(home, local_app, mem_data)
+    init_store = subprocess.run([str(exe), 'store', 'current', '--json'], cwd=str(work_root),
+                                env=mem_env, capture_output=True, text=True, encoding='utf-8', timeout=60)
+    assert init_store.returncode == 0, init_store.stderr[:800]
+    checked.append('memory_store_initialized_for_dsh_data_dir')
+
+    return {
+        'checks': checked,
+        'gateway_command': str(gateway_command),
+        'protocol_version': init['result']['protocolVersion'],
+        'tool_count': len(tools),
+        'live_dsh_host_session': 'NOT ASSESSED — no DSH desktop host was launched',
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--zip', required=True, type=Path)
@@ -228,6 +500,14 @@ def main():
         )
         assert not installed_exe.exists() and (default_data_dir / 'recalldock.db').is_file()
         results['checks']['setup_cmd_and_uninstall_preserve_db'] = True
+
+        # 6b. Native Windows DSH integration: managed block install/upgrade/
+        # idempotency/conflict/rollback, plus a real MCP handshake against the
+        # installed exe. This exercises the configuration format only; it does
+        # not launch the DSH desktop host, so it cannot pass for a live DSH
+        # session.
+        results['checks']['dsh_config_format'] = run_dsh_installer_checks(
+            tmp, rel_dir, manifest, exe, env)
 
         # 7. Gateway MCP stdio: 7 fixed tools across 8 coexisting backends, add/scan/remove/schema-change, Work CAS
         # Test -Interactive refuses non-interactive stdin cleanly
