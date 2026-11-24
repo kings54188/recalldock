@@ -3,9 +3,9 @@ package gateway
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The contributor's tests build synthetic lease structs and call the reclaim
@@ -42,10 +42,7 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	p.MaxLeases = 2
 	// See the teardown note in TestReleasedLeaseFreesCapacity: wait for children
 	// before TempDir cleanup runs.
-	t.Cleanup(func() {
-		p.Close()
-		settleChildExit()
-	})
+	t.Cleanup(p.Close)
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -60,7 +57,7 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	ctx := context.Background()
 	held := make([]*lease, 0, 2)
 	for i := 0; i < 2; i++ {
-		l, err := p.acquire(ctx, "test", t.TempDir(), "s", server)
+		l, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
 		if err != nil {
 			t.Fatalf("lease %d should have been granted: %v", i, err)
 		}
@@ -71,7 +68,7 @@ func TestAcquireRefusesAtLeaseLimitReachingRealBackends(t *testing.T) {
 	}
 
 	// The third distinct root must be refused with a lease_limit error.
-	_, err = p.acquire(ctx, "test", t.TempDir(), "s", server)
+	_, err = p.acquire(ctx, "test", leaseRoot(t), "s", server)
 	if err == nil {
 		t.Fatal("acquire past the lease bound succeeded")
 	}
@@ -98,10 +95,7 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	// assertion passed. Waiting here makes the teardown deterministic instead of
 	// racing the OS. Product code is unaffected; ErrLease and lease_limit
 	// behaviour do not depend on it.
-	t.Cleanup(func() {
-		p.Close()
-		settleChildExit()
-	})
+	t.Cleanup(p.Close)
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -112,13 +106,13 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	server := reg.Servers["test"]
 	ctx := context.Background()
 
-	l, err := p.acquire(ctx, "test", t.TempDir(), "s", server)
+	l, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
 	if err != nil {
 		t.Fatalf("first lease: %v", err)
 	}
 
 	// At the bound: a second root is refused.
-	if _, err := p.acquire(ctx, "test", t.TempDir(), "s", server); err == nil {
+	if _, err := p.acquire(ctx, "test", leaseRoot(t), "s", server); err == nil {
 		t.Fatal("second lease granted past a bound of 1")
 	}
 
@@ -126,7 +120,7 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 	if err := p.Release(l.token); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	after, err := p.acquire(ctx, "test", t.TempDir(), "s", server)
+	after, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
 	if err != nil {
 		t.Fatalf("lease after release was refused: %v", err)
 	}
@@ -230,10 +224,23 @@ func TestLeaseLimitErrorIsExplainable(t *testing.T) {
 	}
 }
 
-// settleChildExit gives the OS a moment to release handles held by a terminated
-// child. Windows does not make the release synchronous with process exit, and a
-// directory still open at TempDir cleanup fails the test after it has already
-// passed its assertions.
-func settleChildExit() {
-	time.Sleep(250 * time.Millisecond)
+// leaseRoot returns a directory to use as a lease root.
+//
+// It deliberately does NOT use t.TempDir(). These roots are only lease keys —
+// acquire never makes them a working directory — but a backend child that was
+// started with a temp path as cwd can still hold a handle on Windows for a short
+// while after Close, and testing.TempDir fails the test when RemoveAll collides
+// with that. Losing an empty directory in /tmp is harmless; failing a passing
+// test is not.
+func leaseRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rd-lease-root-")
+	if err != nil {
+		t.Fatalf("create lease root: %v", err)
+	}
+	t.Cleanup(func() {
+		// Best effort: a straggling child handle is not a test failure.
+		_ = os.RemoveAll(dir)
+	})
+	return dir
 }
