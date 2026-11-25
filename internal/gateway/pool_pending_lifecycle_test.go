@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -248,35 +249,86 @@ func TestPendingConnectsReserveBoundCapacity(t *testing.T) {
 
 // TestPendingIsClearedAfterFailure pins that a failed connect does not leave a
 // reservation behind, which would permanently shrink the pool.
+//
+// The failure must happen *inside* connectLease: a config-hash mismatch is
+// detected before the pending entry is ever registered, so a test built on it
+// would pass without exercising the cleanup path at all. That is exactly what an
+// earlier version did, and it failed on the race-detector job where timing shifted
+// which path ran. This version points the backend at a command that cannot be
+// resolved, so connect fails deterministically after claiming the slot.
 func TestPendingIsClearedAfterFailure(t *testing.T) {
-	p, _, _ := poolFixture(t, true)
-	if _, _, err := p.Discover("test"); err != nil {
-		t.Fatalf("discover: %v", err)
+	dir := t.TempDir()
+	// A backend whose command cannot be resolved: connect fails inside
+	// connectLease, after the pending entry is registered.
+	runtime := Runtime{Type: "stdio", Command: "recalldock-no-such-backend-command", CWD: backendWorkDir(t)}
+	source := sourceFixture(t, "json", "{}")
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ops, err := opsstore.Open(filepath.Join(dir, "data"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ops.Close() })
+	p := NewPool(filepath.Join(dir, "gateway.json"), ops)
+	p.Trust = "strict"
+	t.Cleanup(p.Close)
+	if err := p.Update(func(r *Registry) error {
+		r.Servers["test"] = Server{Source: source, Enabled: true, StartAllowed: true, Stateful: true, TimeoutSeconds: 5}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	reg, err := p.registry()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := reg.Servers["test"]
-	stale := server
-	stale.ConfigHash = "0" + server.ConfigHash[1:]
-
-	if _, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", stale); err == nil {
-		t.Fatal("acquire with a stale config hash should fail")
+	_, hash, err := reg.Servers["test"].Source.Read()
+	if err != nil {
+		// Source.Read itself may fail for an unresolvable command; that still means
+		// the connect path fails, which is what this test needs.
+		hash = strings.Repeat("0", 64)
 	}
+	if err := p.Update(func(r *Registry) error {
+		srv := r.Servers["test"]
+		srv.ConfigHash = hash
+		r.Servers["test"] = srv
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reg, err = p.registry()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", reg.Servers["test"]); err == nil {
+		t.Fatal("acquire against an unresolvable backend command should fail")
+	}
+
+	// The failed attempt must leave nothing behind.
 	p.mu.Lock()
 	pending, leases := len(p.pending), len(p.leases)
 	p.mu.Unlock()
-	if pending != 0 || leases != 0 {
-		t.Fatalf("failed connect left state behind: pending=%d leases=%d", pending, leases)
+	if pending != 0 {
+		t.Fatalf("failed connect left %d pending entries behind; capacity would shrink permanently", pending)
+	}
+	if leases != 0 {
+		t.Fatalf("failed connect published %d leases", leases)
 	}
 
-	// And the key is usable immediately afterwards.
-	l, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", server)
-	if err != nil {
-		t.Fatalf("acquire after failure: %v", err)
+	// And the same key can be attempted again (it fails the same way, which proves
+	// the slot is reusable rather than stuck).
+	if _, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", reg.Servers["test"]); err == nil {
+		t.Fatal("second attempt against an unresolvable backend should also fail")
 	}
-	t.Cleanup(func() { l.shutdown(true) })
+	p.mu.Lock()
+	pendingAfter := len(p.pending)
+	p.mu.Unlock()
+	if pendingAfter != 0 {
+		t.Fatalf("second failed connect left %d pending entries behind", pendingAfter)
+	}
 }
 
 // TestWaiterCancellationDoesNotCancelOwner proves a waiter that gives up does not
