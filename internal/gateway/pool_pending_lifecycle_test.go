@@ -494,3 +494,89 @@ func TestCallDoesNotReturnTokenAfterConcurrentRelease(t *testing.T) {
 	}
 	_ = p.Release(res.token)
 }
+
+// TestLockOrderStress mixes the operations that take p.mu and lease.mu in
+// different orders — acquire, Release, CloseServer, reclaim, idle-timer arming —
+// to surface an ABBA deadlock, a double close, or a use-after-close under -race.
+//
+// The lock order is p.mu before lease.mu everywhere and never the reverse, but a
+// rule that is only written down is not verified; this test exercises the
+// interleavings. A deadlock shows up as the explicit timeout below rather than as
+// a hung CI job.
+func TestLockOrderStress(t *testing.T) {
+	p, _, _ := poolFixture(t, true)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	reg, err := p.registry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := reg.Servers["test"]
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Acquire / release churn.
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				l, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", server)
+				if err != nil {
+					continue
+				}
+				l.done()
+				l.arm(p)
+				_ = p.Release(l.token)
+			}
+		}()
+	}
+	// Server close churn: removes leases then calls shutdown.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.CloseServer("test")
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+	// Reclaim churn: iterates leases while holding p.mu and takes l.mu inside.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.mu.Lock()
+			_ = p.reclaimIdleLeaseLocked()
+			p.mu.Unlock()
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("lock-order stress did not finish; suspect an ABBA deadlock between p.mu and lease.mu")
+	}
+	p.Close()
+}
