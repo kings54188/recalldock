@@ -30,6 +30,19 @@ func TestBackendProcess(t *testing.T) {
 			time.Sleep(time.Hour)
 		}
 	}
+	if mode == "gated" {
+		// Wait for the test to release this backend by creating the sentinel
+		// file. This lets a test hold a connect in flight for exactly as long as
+		// it needs, then let it succeed, without a timing assumption.
+		gate := os.Getenv("RECALLDOCK_GATEWAY_TEST_GATE")
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(gate); err == nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	s := server.NewMCPServer("synthetic", "1", server.WithToolCapabilities(true))
 	echoTool := mcp.NewTool("echo", mcp.WithString("message"))
 	if mode == "schema_v2" {
