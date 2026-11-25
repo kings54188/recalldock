@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -631,4 +632,168 @@ func TestLockOrderStress(t *testing.T) {
 		t.Fatal("lock-order stress did not finish; suspect an ABBA deadlock between p.mu and lease.mu")
 	}
 	p.Close()
+}
+
+// TestCloseWaitsForInFlightConnect pins claim 2a from the independent review.
+//
+// Close marked the pool closed and drained leases, then returned — but a connect
+// already in flight was left to finish on its own, which can take the full
+// backend startup timeout. A child process still starting up at that moment
+// outlives the gateway as an orphan, which is the same process leak this change
+// set exists to prevent, just triggered one step earlier. Close now cancels
+// in-flight attempts and waits for their owners to shut down what they opened.
+func TestCloseWaitsForInFlightConnect(t *testing.T) {
+	p, server, release := gatedPoolFixture(t)
+	acquireDone := make(chan struct{})
+	go func() {
+		defer close(acquireDone)
+		_, _ = p.acquire(context.Background(), "test", leaseRoot(t), "s", server)
+	}()
+	waitForPending(t, p)
+
+	closed := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closed)
+	}()
+
+	// Close must cancel the attempt rather than wait out the 20s server timeout.
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return; it must cancel in-flight connects instead of waiting out the backend timeout")
+	}
+
+	p.mu.Lock()
+	pending := len(p.pending)
+	p.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("Close returned with %d pending connects still in flight; their children would be orphaned", pending)
+	}
+	release()
+	<-acquireDone
+}
+
+// TestStatelessCallAndDiscoverRespectClose pins claim 7a.
+//
+// The non-stateful branch of Call opens its own short-lived connection and never
+// consulted p.closed, so after Pool.Close a tools_call could still start a
+// backend — and Discover could too. Neither leaked (the connection closes when
+// the call returns) but both contradicted the pool contract, and the same call
+// was refused on a stateful backend and allowed on a stateless one.
+func TestStatelessCallAndDiscoverRespectClose(t *testing.T) {
+	p, root, _ := poolFixture(t, false) // stateless
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if _, err := p.Grant("test", GrantOptions{Tool: "echo", ReadOnly: true, Roots: []string{root}}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	p.Close()
+
+	if _, _, err := p.Call(context.Background(), CallRequest{
+		Server: "test", Tool: "echo", Root: root, Session: "s",
+		Arguments: map[string]any{"message": "hi"},
+	}); err == nil {
+		t.Fatal("a stateless Call started a backend after Close")
+	}
+	if _, _, err := p.Discover("test"); err == nil {
+		t.Fatal("Discover started a backend after Close")
+	}
+}
+
+// TestJoinerIsNotRefusedAtBound pins claim 6a.
+//
+// Joining an existing pending attempt costs no extra capacity — the joiner shares
+// the lease that attempt is creating. But the bound was enforced before the join
+// was considered, so at the limit a caller with a perfectly good in-flight
+// attempt for its own key was told to release somebody else's connection.
+func TestJoinerIsNotRefusedAtBound(t *testing.T) {
+	p, server := slowPoolFixture(t)
+	p.maxLeases = 2
+
+	// One published lease, then one in-flight attempt: the pool is at its bound.
+	p.mu.Lock()
+	p.leases["occupied"] = &lease{token: "occupied", refs: 1, server: "test", root: "/x", session: "s"}
+	p.mu.Unlock()
+
+	root := leaseRoot(t)
+	go func() { _, _ = p.acquire(context.Background(), "test", root, "s", server) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		_, ok := p.pending[leaseKey{server: "test", root: root, session: "s"}]
+		p.mu.Unlock()
+		if ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The joiner must wait for the existing attempt rather than be refused with
+	// lease_limit. It will ultimately fail because the backend hangs, but the
+	// failure must not be a capacity refusal.
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.acquire(context.Background(), "test", root, "s", server)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil && strings.Contains(err.Error(), "lease_limit") {
+			t.Fatalf("a joiner for an existing pending key was refused on capacity: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		// Still waiting on the shared attempt is the expected outcome.
+	}
+}
+
+// TestOwnerCancellationDoesNotFailHealthyWaiter pins claim 5.
+//
+// The connect ran on the owner's context. If the owner gave up, every waiter
+// received the owner's error even though their own contexts were healthy — one
+// cancelled host request could fail unrelated concurrent calls for the same
+// backend session.
+func TestOwnerCancellationDoesNotFailHealthyWaiter(t *testing.T) {
+	p, server, release := gatedPoolFixture(t)
+	p.maxLeases = 4
+
+	ownerCtx, ownerCancel := context.WithCancel(context.Background())
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := p.acquire(ownerCtx, "test", leaseRoot(t), "s", server)
+		ownerDone <- err
+	}()
+	waitForPending(t, p)
+
+	// Find the key the owner registered so the second caller joins it.
+	p.mu.Lock()
+	var key leaseKey
+	for k := range p.pending {
+		key = k
+	}
+	p.mu.Unlock()
+
+	waiterDone := make(chan error, 1)
+	waiterLease := make(chan *lease, 1)
+	go func() {
+		l, err := p.acquire(context.Background(), "test", key.root, "s", server)
+		waiterLease <- l
+		waiterDone <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	ownerCancel()
+	release() // let the gated backend complete for whoever still wants it
+
+	oErr := <-ownerDone
+	wErr := <-waiterDone
+	wLease := <-waiterLease
+
+	if oErr != nil && wErr != nil && oErr.Error() == wErr.Error() && !errors.Is(wErr, context.Canceled) {
+		t.Fatalf("healthy waiter received the owner's failure verbatim (%v); a cancelled owner must not fail other callers", wErr)
+	}
+	if wLease != nil {
+		wLease.shutdown(true)
+	}
 }

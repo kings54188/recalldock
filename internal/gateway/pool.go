@@ -66,6 +66,9 @@ type pendingConnect struct {
 	ready chan struct{}
 	lease *lease
 	err   error
+	// cancel aborts the owner's connect. Pool.Close uses it so a shutdown does not
+	// have to wait out a backend's full startup timeout before returning.
+	cancel context.CancelFunc
 }
 
 type lease struct {
@@ -320,6 +323,14 @@ func clipText(s string, n int) string {
 // Discover connects once to an operator-approved backend, caches bounded tool
 // metadata and closes the connection. Discovery never starts all servers.
 func (p *Pool) Discover(serverID string) (Server, []opsstore.ToolRecord, error) {
+	// Discovery starts a backend to read its tool list, so it must respect the
+	// closed flag like acquire does.
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return Server{}, nil, ErrUnavailable
+	}
 	server, _, hash, conn, records, err := p.discoverWith(serverID)
 	if err != nil {
 		return server, nil, err
@@ -570,6 +581,11 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 			p.mu.Unlock()
 			return nil, ErrUnavailable
 		}
+		// Leases removed here are shut down after p.mu is released: shutdown can
+		// terminate a process, and doing that while holding the pool lock would
+		// reintroduce the stall this change set removed (a backend that ignores
+		// SIGTERM blocks the pool for its whole kill timeout).
+		var toClose []*lease
 		// Reuse a live lease for this key, exactly as before.
 		for _, l := range p.leases {
 			if l.server != serverID || l.root != root || l.session != session {
@@ -582,7 +598,7 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 				l.mu.Lock()
 				l.released = true
 				l.mu.Unlock()
-				l.shutdown(false)
+				toClose = append(toClose, l)
 				continue
 			}
 			l.mu.Lock()
@@ -601,41 +617,83 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 			l.mu.Lock()
 			l.released = true
 			l.mu.Unlock()
-			l.shutdown(true)
+			toClose = append(toClose, l)
+		}
+		if len(toClose) > 0 {
+			p.mu.Unlock()
+			for _, l := range toClose {
+				l.shutdown(true)
+			}
+			// Re-acquire and re-evaluate: the pool changed while the lock was
+			// released, so the reuse scan must run again rather than continuing on a
+			// stale view.
+			p.mu.Lock()
+			continue
 		}
 
 		if !server.StartAllowed {
 			p.mu.Unlock()
 			return nil, ErrApproval
 		}
-		if err := p.reclaimIdleLeaseLocked(); err != nil {
-			p.mu.Unlock()
-			return nil, err
-		}
-
+		// A caller that joins an existing pending attempt consumes no extra capacity:
+		// it shares the lease that attempt is already creating. So the join must be
+		// checked before the bound is enforced, otherwise a caller at the limit with a
+		// perfectly good in-flight attempt for its own key is told to go release
+		// somebody else's connection.
 		// Another caller is already connecting this exact key. Wait for it rather
 		// than opening a second backend, then re-evaluate: its result may be
 		// reusable, or it may have failed and we start our own attempt.
 		if pending, ok := p.pending[key]; ok {
+			// Note the attempt we joined. If it ends in failure we compare against
+			// this entry so we only retry for a genuinely finished attempt, not one
+			// that is still the same pending record.
+			joined := pending
 			p.mu.Unlock()
 			select {
 			case <-pending.ready:
 			case <-ctx.Done():
 				return nil, ErrUnavailable
 			}
-			if pending.err != nil {
-				return nil, pending.err
+			if joined.err != nil {
+				// The attempt we joined failed. That failure belongs to its owner: the
+				// owner's context may have been cancelled, or its connect may have hit a
+				// transient problem, while this caller is healthy and still wants a
+				// connection. Returning the owner's error here would fail a caller that
+				// did nothing wrong and could have succeeded on its own attempt.
+				//
+				// Retry once from the top, where a fresh attempt is made (or an existing
+				// live lease is reused). A caller whose own context is cancelled is still
+				// handled above.
+				if ctx.Err() == nil {
+					continue
+				}
+				return nil, joined.err
 			}
 			// Fall through to the reuse path with the finished lease available.
 			continue
 		}
 
+		if err := p.reclaimIdleLeaseLocked(); err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
+
 		// Claim the connect. Everything from here to the store is outside p.mu.
-		pending := &pendingConnect{ready: make(chan struct{})}
+		//
+		// The connect runs on a context derived from the caller's but detached from
+		// its cancellation, because the result is shared: if the caller that happens
+		// to own the attempt gives up, every waiter would receive that caller's
+		// cancellation error even though their own contexts are healthy. Waiters
+		// still return early on their own ctx (below); the connect itself is
+		// cancelled only by Pool.Close via pending.cancel, bounded by the server
+		// timeout inside connectLease.
+		connectCtx, cancelConnect := context.WithCancel(context.WithoutCancel(ctx))
+		pending := &pendingConnect{ready: make(chan struct{}), cancel: cancelConnect}
 		p.pending[key] = pending
 		p.mu.Unlock()
 
-		lease, err := p.connectLease(ctx, key, server)
+		lease, err := p.connectLease(connectCtx, key, server)
+		cancelConnect()
 
 		p.mu.Lock()
 		delete(p.pending, key)
@@ -868,6 +926,17 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 		conn = created.conn
 		defer func() { l.done(); l.arm(p) }()
 	} else {
+		// A non-stateful call opens its own short-lived connection, which used to
+		// bypass the closed check entirely: after Pool.Close a tools_call could still
+		// start a backend. This does not leak (the connection is closed when the call
+		// returns) but it contradicts the pool's contract and behaves differently
+		// from the stateful path for the same closed pool.
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
+			return nil, "", ErrUnavailable
+		}
 		cctx, cancel := context.WithTimeout(ctx, server.Timeout())
 		defer cancel()
 		fresh, err := connect(cctx, runtime, backendCWD(runtime))
@@ -922,20 +991,48 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 	return result, token, nil
 }
 
-// Close only terminates processes/connections owned by this gateway.
+// Close terminates every backend process/connection owned by this gateway and
+// waits for in-flight connection attempts to finish terminating theirs.
 //
-// It marks the pool closed before draining so that no connect which is currently
-// in flight can publish a lease afterwards (see acquire). Pending entries are
-// left to their own completion path: each owner observes p.closed and shuts its
-// fresh connection down instead of inserting it, so in-flight connects terminate
-// their own children rather than being abandoned.
+// It marks the pool closed first so no connect can publish a lease afterwards.
+// Draining leases and cancelling pending attempts both happen under p.mu, and
+// released is set there rather than in a later shutdown: a Call finishing during
+// the drain must not observe "not released" for a lease the pool already dropped,
+// or it would publish a token that getLease immediately rejects (D4).
+//
+// Pending connects are cancelled and waited for. Leaving them to finish on their
+// own meant Close could return while a child process was still starting up, and
+// that child would outlive the gateway as an orphan — the same process leak this
+// change set is meant to prevent, just triggered one step earlier.
 func (p *Pool) Close() {
 	p.mu.Lock()
 	p.closed = true
 	leases := p.leases
 	p.leases = map[string]*lease{}
+	// Mark released inside the same critical section as the drain.
+	for _, l := range leases {
+		l.mu.Lock()
+		l.released = true
+		l.mu.Unlock()
+	}
+	pending := make([]*pendingConnect, 0, len(p.pending))
+	for _, pc := range p.pending {
+		pending = append(pending, pc)
+	}
 	p.mu.Unlock()
+
 	for _, l := range leases {
 		l.shutdown(true)
+	}
+	// Cancel in-flight connects so their owners stop waiting on a backend that is
+	// about to belong to a closed pool, then wait for them to shut their own
+	// children down. Each owner observes p.closed and closes what it opened.
+	for _, pc := range pending {
+		if pc.cancel != nil {
+			pc.cancel()
+		}
+	}
+	for _, pc := range pending {
+		<-pc.ready
 	}
 }
