@@ -535,6 +535,12 @@ func TestReleaseInvalidatesTokenBeforeItLeavesThePool(t *testing.T) {
 // in flight while the lease is released must not hand back that token.
 func TestCallDoesNotReturnTokenAfterConcurrentRelease(t *testing.T) {
 	p, root, marker := poolFixture(t, true)
+	// Call canonicalises the root before keying its lease, so the direct
+	// acquire below must use the same form. On Windows the temporary
+	// directory can be the 8.3 short path, which canonicalPath resolves to a
+	// different string; using the raw path here would acquire a second lease
+	// for a different key and the call would never touch this one.
+	root = canonicalPath(root)
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -580,6 +586,15 @@ func TestCallDoesNotReturnTokenAfterConcurrentRelease(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(marker); len(b) == 0 {
 		t.Skip("backend did not report start; skipping rather than asserting on an unstarted call")
+	}
+	// The tool is running, so the call must hold a reference on THIS lease.
+	// Without this, a key mismatch would let the call run on a second
+	// connection while the test released an unrelated one and still passed.
+	l.mu.Lock()
+	refs := l.refs
+	l.mu.Unlock()
+	if refs < 1 {
+		t.Fatalf("the in-flight call is not referenced on the lease under test (refs=%d)", refs)
 	}
 
 	if err := p.Release(token); err != nil {
@@ -965,6 +980,7 @@ func TestAcquireReplacesDeadSameKeyLeaseWithoutDeadlock(t *testing.T) {
 
 func TestConfigDriftDoesNotInterruptInFlightTool(t *testing.T) {
 	p, root, marker := poolFixture(t, true)
+	root = canonicalPath(root)
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -1290,6 +1306,7 @@ func TestOldServerSnapshotCannotRetireNewLease(t *testing.T) {
 
 func TestRetiringLeaseCountsAgainstProcessCapacity(t *testing.T) {
 	p, root, marker := poolFixture(t, true)
+	root = canonicalPath(root)
 	p.maxLeases = 1
 	if _, _, err := p.Discover("test"); err != nil {
 		t.Fatalf("discover: %v", err)
