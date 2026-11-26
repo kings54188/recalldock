@@ -49,6 +49,9 @@ func TestBackendProcess(t *testing.T) {
 		echoTool = mcp.NewTool("echo", mcp.WithString("message"), mcp.WithString("extra_v2"))
 	}
 	s.AddTool(echoTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if mode == "exit_on_call" {
+			os.Exit(0)
+		}
 		if req.GetString("message", "") == "wait" {
 			if marker := os.Getenv("RECALLDOCK_GATEWAY_TEST_STARTED"); marker != "" {
 				if f, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600); err == nil {

@@ -32,8 +32,11 @@ type Pool struct {
 	// tests in this package can lower it, and only to reach the boundary with a
 	// few synthetic leases instead of 512 real backend processes.
 	maxLeases int
-	mu        sync.Mutex
-	leases    map[string]*lease
+	// testPendingTransition provides deterministic gates around pending publication.
+	testPendingTransition func(string, *lease)
+	mu                    sync.Mutex
+	leases                map[string]*lease
+	retiring              map[*lease]struct{}
 	// closed is set by Close. It exists because connecting happens outside p.mu
 	// (see acquire): without it, a connect that finishes after Close would insert
 	// its lease into a pool nobody owns, so the backend process would leak with no
@@ -50,7 +53,11 @@ type Pool struct {
 	// len(leases)+len(pending). Counting only len(leases) let several concurrent
 	// connects pass the bound check and then all succeed, overshooting
 	// maxConcurrentLeases.
-	pending map[leaseKey]*pendingConnect
+	pending          map[leaseKey]*pendingConnect
+	transient        map[*transientConnect]struct{}
+	serverGeneration map[string]uint64
+	serverConfigHash map[string]string
+	discoveryLocks   map[string]*sync.Mutex
 }
 
 // leaseKey is the identity a lease is keyed by. It is a struct rather than a
@@ -64,11 +71,24 @@ type leaseKey struct {
 // same key wait on ready instead of starting a second backend.
 type pendingConnect struct {
 	ready chan struct{}
+	done  chan struct{}
 	lease *lease
 	err   error
+	// waiters counts callers sharing this attempt. It is protected by p.mu.
+	waiters       int
+	ownerCanceled bool
+	ownerReleased bool
+	// invalidated prevents CloseServer, Remove, or Close from publishing a late
+	// connection after they have revoked this attempt.
+	invalidated bool
 	// cancel aborts the owner's connect. Pool.Close uses it so a shutdown does not
 	// have to wait out a backend's full startup timeout before returning.
 	cancel context.CancelFunc
+}
+
+type transientConnect struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type lease struct {
@@ -76,6 +96,7 @@ type lease struct {
 	token, server, root, session string
 	configHash                   string
 	conn                         *connection
+	pool                         *Pool
 	refs                         int
 	released                     bool
 	timer                        *time.Timer
@@ -92,7 +113,103 @@ type CallRequest struct {
 }
 
 func NewPool(registryPath string, ops *opsstore.Store) *Pool {
-	return &Pool{RegistryPath: registryPath, Ops: ops, IdleTTL: 5 * time.Minute, Trust: "agent", leases: map[string]*lease{}, pending: map[leaseKey]*pendingConnect{}}
+	return &Pool{
+		RegistryPath:     registryPath,
+		Ops:              ops,
+		IdleTTL:          5 * time.Minute,
+		Trust:            "agent",
+		leases:           map[string]*lease{},
+		retiring:         map[*lease]struct{}{},
+		pending:          map[leaseKey]*pendingConnect{},
+		transient:        map[*transientConnect]struct{}{},
+		serverGeneration: map[string]uint64{},
+		serverConfigHash: map[string]string{},
+		discoveryLocks:   map[string]*sync.Mutex{},
+	}
+}
+
+func (p *Pool) beginTransient(parent context.Context) (context.Context, *transientConnect, error) {
+	ctx, cancel := context.WithCancel(parent)
+	op := &transientConnect{cancel: cancel, done: make(chan struct{})}
+	for {
+		if parent.Err() != nil {
+			cancel()
+			return nil, nil, ErrUnavailable
+		}
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			cancel()
+			return nil, nil, ErrUnavailable
+		}
+		reclaimed, reclaimErr := p.reclaimIdleLeasesLocked()
+		if len(reclaimed) > 0 {
+			p.mu.Unlock()
+			for _, l := range reclaimed {
+				l.shutdown(true)
+			}
+			continue
+		}
+		if reclaimErr != nil {
+			p.mu.Unlock()
+			cancel()
+			return nil, nil, reclaimErr
+		}
+		p.transient[op] = struct{}{}
+		p.mu.Unlock()
+		return ctx, op, nil
+	}
+}
+
+func (p *Pool) endTransient(op *transientConnect) {
+	p.mu.Lock()
+	delete(p.transient, op)
+	p.mu.Unlock()
+	op.cancel()
+	close(op.done)
+}
+
+func (p *Pool) finishRetiring(l *lease) {
+	p.mu.Lock()
+	delete(p.retiring, l)
+	p.mu.Unlock()
+}
+
+func (p *Pool) releasePendingOwner(pending *pendingConnect) {
+	p.mu.Lock()
+	lease := pending.lease
+	release := lease != nil && !pending.ownerReleased
+	retire := false
+	if release {
+		pending.ownerReleased = true
+		if pending.waiters == 0 && p.leases[lease.token] == lease {
+			delete(p.leases, lease.token)
+			lease.mu.Lock()
+			lease.released = true
+			lease.pool = p
+			lease.mu.Unlock()
+			p.retiring[lease] = struct{}{}
+			retire = true
+		}
+	}
+	p.mu.Unlock()
+	if release {
+		lease.done()
+		if !retire {
+			lease.arm(p)
+		}
+	}
+}
+
+func (p *Pool) discoveryLock(serverID string) *sync.Mutex {
+	p.mu.Lock()
+	lock := p.discoveryLocks[serverID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		p.discoveryLocks[serverID] = lock
+	}
+	p.mu.Unlock()
+	return lock
 }
 
 // maxConcurrentLeases bounds live backend processes (not registered servers).
@@ -112,8 +229,8 @@ func (p *Pool) leaseLimit() int {
 	return maxConcurrentLeases
 }
 
-// reclaimIdleLeaseLocked frees leases that are provably safe to drop and then
-// fails when the pool is still at its bound. Callers must hold p.mu.
+// reclaimIdleLeasesLocked removes leases that are provably safe to drop and
+// returns them for shutdown after p.mu is released. Callers must hold p.mu.
 //
 // Three distinct quantities matter here, and conflating them was the mistake
 // behind Issue #6:
@@ -138,27 +255,34 @@ func (p *Pool) leaseLimit() int {
 // live lease. Without that, several concurrent connects could each observe
 // len(leases) < limit, all proceed, and then all succeed — overshooting the
 // bound that exists to bound backend processes.
-func (p *Pool) reclaimIdleLeaseLocked() error {
+func (p *Pool) reclaimIdleLeasesLocked() ([]*lease, error) {
 	limit := p.leaseLimit()
 	// releasedOrDead leases free capacity; pending ones hold a reservation.
-	held := len(p.leases) + len(p.pending)
+	held := len(p.leases) + len(p.pending) + len(p.retiring) + len(p.transient)
 	if held < limit {
-		return nil
+		return nil, nil
 	}
+	var closing []*lease
 	for token, l := range p.leases {
 		l.mu.Lock()
 		conn := l.conn
 		drop := l.refs == 0 && (l.released || conn == nil || !conn.Alive())
+		if drop {
+			l.released = true
+			l.pool = p
+		}
 		l.mu.Unlock()
 		if drop {
 			delete(p.leases, token)
-			l.shutdown(true)
+			p.retiring[l] = struct{}{}
+			closing = append(closing, l)
 		}
 	}
-	if held = len(p.leases) + len(p.pending); held >= limit {
-		return fmt.Errorf("lease_limit: %d backend connections are held (bound %d); calls in flight are never evicted, and idle stateful connections stay until released, so release ones you no longer need with tools_release and retry", held, limit)
+	held = len(p.leases) + len(p.pending) + len(p.retiring) + len(p.transient)
+	if held-len(closing) >= limit {
+		return closing, fmt.Errorf("lease_limit: %d backend connections are held (bound %d); calls in flight are never evicted, and idle stateful connections stay until released, so release ones you no longer need with tools_release and retry", held, limit)
 	}
-	return nil
+	return closing, nil
 }
 
 func randomToken() string {
@@ -268,7 +392,7 @@ func backendCWD(runtime Runtime) string {
 	return cwd
 }
 
-func (p *Pool) discoverWith(serverID string) (Server, Runtime, string, *connection, []opsstore.ToolRecord, error) {
+func (p *Pool) discoverWith(ctx context.Context, serverID string) (Server, Runtime, string, *connection, []opsstore.ToolRecord, error) {
 	reg, err := p.registry()
 	if err != nil {
 		return Server{}, Runtime{}, "", nil, nil, err
@@ -287,7 +411,7 @@ func (p *Pool) discoverWith(serverID string) (Server, Runtime, string, *connecti
 	if err != nil {
 		return Server{}, Runtime{}, "", nil, nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), server.Timeout())
+	ctx, cancel := context.WithTimeout(ctx, server.Timeout())
 	defer cancel()
 	conn, err := connect(ctx, runtime, backendCWD(runtime))
 	if err != nil {
@@ -323,35 +447,80 @@ func clipText(s string, n int) string {
 // Discover connects once to an operator-approved backend, caches bounded tool
 // metadata and closes the connection. Discovery never starts all servers.
 func (p *Pool) Discover(serverID string) (Server, []opsstore.ToolRecord, error) {
-	// Discovery starts a backend to read its tool list, so it must respect the
-	// closed flag like acquire does.
-	p.mu.Lock()
-	closed := p.closed
-	p.mu.Unlock()
-	if closed {
-		return Server{}, nil, ErrUnavailable
+	lock := p.discoveryLock(serverID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	ctx, operation, err := p.beginTransient(context.Background())
+	if err != nil {
+		return Server{}, nil, err
 	}
-	server, _, hash, conn, records, err := p.discoverWith(serverID)
+	defer p.endTransient(operation)
+
+	server, _, hash, conn, records, err := p.discoverWith(ctx, serverID)
 	if err != nil {
 		return server, nil, err
 	}
 	defer conn.Close()
+	if ctx.Err() != nil {
+		return server, nil, ErrUnavailable
+	}
+	if _, currentHash, err := server.Source.Read(); err != nil || currentHash != hash {
+		return server, nil, ErrChanged
+	}
+	previous, err := p.Ops.LoadCatalog(serverID)
+	if err != nil {
+		return server, nil, err
+	}
 	if err := p.Ops.SaveCatalog(serverID, hash, records); err != nil {
 		return server, nil, err
 	}
 	// Keep the registry identity aligned with the catalog this discovery just
 	// created. Without it a successful discover could still leave Call with a
 	// stale config_hash and reject every agent-mode call.
+	changed := false
 	if err := p.Update(func(reg *Registry) error {
-		current := reg.Servers[serverID]
+		current, ok := reg.Servers[serverID]
+		if !ok {
+			return ErrUnavailable
+		}
 		if current.ConfigHash != hash {
+			changed = true
 			current.ConfigHash = hash
 			current.Grants = nil
 		}
 		reg.Servers[serverID] = current
 		return nil
 	}); err != nil {
+		var rollbackErr error
+		if len(previous) == 0 {
+			rollbackErr = p.Ops.RemoveServerCatalog(serverID)
+		} else {
+			rollbackErr = p.Ops.SaveCatalog(serverID, previous[0].ConfigHash, previous)
+		}
+		if rollbackErr != nil {
+			return server, nil, errors.Join(err, fmt.Errorf("restore previous catalog: %w", rollbackErr))
+		}
 		return server, nil, err
+	}
+	p.mu.Lock()
+	p.serverConfigHash[serverID] = hash
+	var invalidated []*pendingConnect
+	if changed {
+		p.serverGeneration[serverID]++
+		for key, pending := range p.pending {
+			if key.server == serverID {
+				pending.invalidated = true
+				invalidated = append(invalidated, pending)
+			}
+		}
+	}
+	p.mu.Unlock()
+	for _, pending := range invalidated {
+		pending.cancel()
+	}
+	for _, pending := range invalidated {
+		<-pending.done
 	}
 	return server, records, nil
 }
@@ -461,6 +630,10 @@ func (p *Pool) Revoke(serverID, tool string) error {
 // Remove deletes the backend definition and its cached catalog, denies new
 // calls immediately and defers closing live leases until in-flight calls end.
 func (p *Pool) Remove(serverID string) error {
+	lock := p.discoveryLock(serverID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	err := p.Update(func(reg *Registry) error {
 		if _, ok := reg.Servers[serverID]; !ok {
 			return fmt.Errorf("unknown backend %q", serverID)
@@ -471,15 +644,16 @@ func (p *Pool) Remove(serverID string) error {
 	if err != nil {
 		return err
 	}
-	if err := p.Ops.RemoveServerCatalog(serverID); err != nil {
-		return err
-	}
+	// Once the registry no longer contains the server, invalidate its live and
+	// pending lifecycle immediately. Catalog cleanup may fail independently, but
+	// that must not let a removed backend publish or retain a connection.
 	p.CloseServer(serverID)
-	return nil
+	return p.Ops.RemoveServerCatalog(serverID)
 }
 
 func (p *Pool) CloseServer(serverID string) {
 	p.mu.Lock()
+	p.serverGeneration[serverID]++
 	var closing []*lease
 	for token, l := range p.leases {
 		if l.server == serverID {
@@ -490,12 +664,32 @@ func (p *Pool) CloseServer(serverID string) {
 			// gone from the pool.
 			l.mu.Lock()
 			l.released = true
+			l.pool = p
 			l.mu.Unlock()
+			p.retiring[l] = struct{}{}
+		}
+	}
+	var pending []*pendingConnect
+	for key, pc := range p.pending {
+		if key.server == serverID {
+			pc.invalidated = true
+			pending = append(pending, pc)
 		}
 	}
 	p.mu.Unlock()
+
+	for _, pc := range pending {
+		if pc.cancel != nil {
+			pc.cancel()
+		}
+	}
 	for _, l := range closing {
+		// Server removal and configuration drift retire the lease without
+		// interrupting tool calls that already hold a reference.
 		l.shutdown(false)
+	}
+	for _, pc := range pending {
+		<-pc.done
 	}
 }
 
@@ -505,13 +699,17 @@ func (l *lease) shutdown(force bool) {
 	if l.timer != nil {
 		l.timer.Stop()
 	}
-	closeNow := l.refs == 0 || force
 	conn := l.conn
+	closeNow := l.refs == 0 || force || conn == nil
+	pool := l.pool
 	l.mu.Unlock()
 	// A lease that never finished acquiring has no connection; shutdown is
 	// still the right call for it, so tolerate the nil rather than panic.
 	if closeNow && conn != nil {
 		conn.Close()
+	}
+	if closeNow && pool != nil {
+		pool.finishRetiring(l)
 	}
 }
 
@@ -522,9 +720,13 @@ func (l *lease) done() {
 	}
 	closeNow := l.refs == 0 && l.released
 	conn := l.conn
+	pool := l.pool
 	l.mu.Unlock()
 	if closeNow && conn != nil {
 		conn.Close()
+	}
+	if closeNow && pool != nil {
+		pool.finishRetiring(l)
 	}
 }
 
@@ -545,12 +747,18 @@ func (l *lease) arm(p *Pool) {
 		idle := l.timerEpoch == epoch && l.refs == 0 && !l.released
 		if idle {
 			l.released = true
+			l.pool = p
 			delete(p.leases, l.token)
+			p.retiring[l] = struct{}{}
 		}
+		conn := l.conn
 		l.mu.Unlock()
 		p.mu.Unlock()
+		if idle && conn != nil {
+			conn.Close()
+		}
 		if idle {
-			l.conn.Close()
+			p.finishRetiring(l)
 		}
 	})
 	l.mu.Unlock()
@@ -574,10 +782,20 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 		return nil, ErrUnavailable
 	}
 	key := leaseKey{server: serverID, root: root, session: session}
+	p.mu.Lock()
+	generation := p.serverGeneration[serverID]
+	knownHash, tracked := p.serverConfigHash[serverID]
+	p.mu.Unlock()
+	if tracked && knownHash != server.ConfigHash {
+		return nil, ErrChanged
+	}
 
 	for {
+		if ctx.Err() != nil {
+			return nil, ErrUnavailable
+		}
 		p.mu.Lock()
-		if p.closed {
+		if p.closed || p.serverGeneration[serverID] != generation {
 			p.mu.Unlock()
 			return nil, ErrUnavailable
 		}
@@ -585,7 +803,8 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 		// terminate a process, and doing that while holding the pool lock would
 		// reintroduce the stall this change set removed (a backend that ignores
 		// SIGTERM blocks the pool for its whole kill timeout).
-		var toClose []*lease
+		var retire []*lease
+		var forceClose []*lease
 		// Reuse a live lease for this key, exactly as before.
 		for _, l := range p.leases {
 			if l.server != serverID || l.root != root || l.session != session {
@@ -593,41 +812,42 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 			}
 			if l.configHash != server.ConfigHash {
 				delete(p.leases, l.token)
-				// Mark released under p.mu, before shutdown, so a concurrent Call
-				// cannot publish a token this removal just invalidated.
 				l.mu.Lock()
 				l.released = true
+				l.pool = p
 				l.mu.Unlock()
-				toClose = append(toClose, l)
+				p.retiring[l] = struct{}{}
+				retire = append(retire, l)
 				continue
 			}
 			l.mu.Lock()
-			usable := !l.released && l.conn.Alive()
-			l.refs++
-			l.mu.Unlock()
+			conn := l.conn
+			usable := !l.released && conn != nil && conn.Alive()
 			if usable {
+				l.refs++
+				l.mu.Unlock()
 				p.mu.Unlock()
 				return l, nil
 			}
-			l.mu.Lock()
-			l.refs--
-			l.mu.Unlock()
-			// Do not leave a dead lease addressable by its old token.
-			delete(p.leases, l.token)
-			l.mu.Lock()
 			l.released = true
+			l.pool = p
 			l.mu.Unlock()
-			toClose = append(toClose, l)
+			// Do not leave a dead lease addressable by its old token. A dead
+			// backend cannot finish an in-flight tool, so its cleanup is forced.
+			delete(p.leases, l.token)
+			p.retiring[l] = struct{}{}
+			forceClose = append(forceClose, l)
 		}
-		if len(toClose) > 0 {
+		if len(retire) > 0 || len(forceClose) > 0 {
 			p.mu.Unlock()
-			for _, l := range toClose {
+			for _, l := range retire {
+				// Configuration drift retires the old connection for new calls but
+				// preserves tools already executing on it.
+				l.shutdown(false)
+			}
+			for _, l := range forceClose {
 				l.shutdown(true)
 			}
-			// Re-acquire and re-evaluate: the pool changed while the lock was
-			// released, so the reuse scan must run again rather than continuing on a
-			// stale view.
-			p.mu.Lock()
 			continue
 		}
 
@@ -644,89 +864,148 @@ func (p *Pool) acquire(ctx context.Context, serverID, root, session string, serv
 		// than opening a second backend, then re-evaluate: its result may be
 		// reusable, or it may have failed and we start our own attempt.
 		if pending, ok := p.pending[key]; ok {
-			// Note the attempt we joined. If it ends in failure we compare against
-			// this entry so we only retry for a genuinely finished attempt, not one
-			// that is still the same pending record.
 			joined := pending
+			joined.waiters++
 			p.mu.Unlock()
 			select {
-			case <-pending.ready:
+			case <-joined.ready:
 			case <-ctx.Done():
+			}
+			p.mu.Lock()
+			joined.waiters--
+			joinedErr := joined.err
+			invalidated := joined.invalidated
+			cancelShared := ctx.Err() != nil && joined.ownerCanceled && joined.waiters == 0
+			var abandon *lease
+			if cancelShared && joined.ownerReleased && joined.lease != nil && p.leases[joined.lease.token] == joined.lease {
+				abandon = joined.lease
+				delete(p.leases, abandon.token)
+				abandon.mu.Lock()
+				abandon.released = true
+				abandon.pool = p
+				abandon.mu.Unlock()
+				p.retiring[abandon] = struct{}{}
+			}
+			p.mu.Unlock()
+			if cancelShared && joined.cancel != nil {
+				joined.cancel()
+			}
+			if abandon != nil {
+				abandon.shutdown(false)
+			}
+			if ctx.Err() != nil {
 				return nil, ErrUnavailable
 			}
-			if joined.err != nil {
-				// The attempt we joined failed. That failure belongs to its owner: the
-				// owner's context may have been cancelled, or its connect may have hit a
-				// transient problem, while this caller is healthy and still wants a
-				// connection. Returning the owner's error here would fail a caller that
-				// did nothing wrong and could have succeeded on its own attempt.
-				//
-				// Retry once from the top, where a fresh attempt is made (or an existing
-				// live lease is reused). A caller whose own context is cancelled is still
-				// handled above.
-				if ctx.Err() == nil {
-					continue
+			if joinedErr != nil {
+				// A normal connect failure belongs to its owner, so a healthy waiter
+				// retries through a fresh shared attempt. Server or pool invalidation
+				// is authoritative and must not be retried with the stale Server value.
+				if invalidated {
+					return nil, joinedErr
 				}
-				return nil, joined.err
+				continue
 			}
 			// Fall through to the reuse path with the finished lease available.
 			continue
 		}
 
-		if err := p.reclaimIdleLeaseLocked(); err != nil {
+		reclaimed, reclaimErr := p.reclaimIdleLeasesLocked()
+		if len(reclaimed) > 0 {
 			p.mu.Unlock()
-			return nil, err
+			for _, l := range reclaimed {
+				l.shutdown(true)
+			}
+			continue
+		}
+		if reclaimErr != nil {
+			p.mu.Unlock()
+			return nil, reclaimErr
 		}
 
-		// Claim the connect. Everything from here to the store is outside p.mu.
-		//
-		// The connect runs on a context derived from the caller's but detached from
-		// its cancellation, because the result is shared: if the caller that happens
-		// to own the attempt gives up, every waiter would receive that caller's
-		// cancellation error even though their own contexts are healthy. Waiters
-		// still return early on their own ctx (below); the connect itself is
-		// cancelled only by Pool.Close via pending.cancel, bounded by the server
-		// timeout inside connectLease.
+		// Claim the connect before releasing p.mu so its capacity reservation is
+		// visible atomically with the limit check.
 		connectCtx, cancelConnect := context.WithCancel(context.WithoutCancel(ctx))
-		pending := &pendingConnect{ready: make(chan struct{}), cancel: cancelConnect}
+		pending := &pendingConnect{
+			ready:  make(chan struct{}),
+			done:   make(chan struct{}),
+			cancel: cancelConnect,
+		}
 		p.pending[key] = pending
 		p.mu.Unlock()
-
-		lease, err := p.connectLease(connectCtx, key, server)
-		cancelConnect()
-
-		p.mu.Lock()
-		delete(p.pending, key)
-		pending.err = err
-		// Publish only if the pool is still open. A connect that finishes after
-		// Close has a live backend process and no owner: inserting it would leak
-		// the process, since nothing would ever release a lease the caller is
-		// about to be told does not exist.
-		if err == nil && lease != nil {
-			if p.closed {
-				pending.lease, pending.err = nil, ErrUnavailable
-			} else {
-				pending.lease = lease
-				p.leases[lease.token] = lease
+		go func() {
+			select {
+			case <-ctx.Done():
+				p.mu.Lock()
+				pending.ownerCanceled = true
+				cancelShared := pending.waiters == 0
+				p.mu.Unlock()
+				if cancelShared {
+					cancelConnect()
+				}
+			case <-pending.done:
 			}
+		}()
+		for _, l := range reclaimed {
+			l.shutdown(true)
 		}
-		close(pending.ready)
-		p.mu.Unlock()
 
-		if err != nil {
-			return nil, err
-		}
-		if pending.lease == nil {
-			// Lost the race with Close: close the connection we opened rather than
-			// leaving the child process running.
-			lease.shutdown(true)
+		func() {
+			defer close(pending.done)
+			lease, err := p.connectLease(connectCtx, key, server)
+			if err == nil && lease != nil && p.testPendingTransition != nil {
+				p.testPendingTransition("connected", lease)
+			}
+			cancelConnect()
+
+			p.mu.Lock()
+			delete(p.pending, key)
+			pending.err = err
+			ownerCanceled := pending.ownerCanceled || ctx.Err() != nil
+			pending.ownerCanceled = ownerCanceled
+			if err == nil && lease != nil && p.testPendingTransition != nil {
+				p.testPendingTransition("publishing", lease)
+			}
+			if p.closed || pending.invalidated || p.serverGeneration[serverID] != generation {
+				pending.invalidated = true
+				pending.err = ErrUnavailable
+			} else if err == nil && lease != nil {
+				if ownerCanceled && pending.waiters == 0 {
+					pending.err = ErrUnavailable
+				} else {
+					pending.lease = lease
+					p.leases[lease.token] = lease
+				}
+			}
+			close(pending.ready)
+			p.mu.Unlock()
+
+			if pending.lease == nil {
+				if lease != nil {
+					if p.testPendingTransition != nil {
+						p.testPendingTransition("cleanup", lease)
+					}
+					lease.shutdown(true)
+				}
+				return
+			}
+			if ownerCanceled {
+				p.releasePendingOwner(pending)
+				return
+			}
+			lease.arm(p)
+		}()
+
+		if ctx.Err() != nil {
+			p.releasePendingOwner(pending)
 			return nil, ErrUnavailable
 		}
-		// Arm the idle timer outside p.mu: arm only takes l.mu, and the timer
-		// callback acquires p.mu, so calling it under the pool lock would deadlock
-		// if the TTL were short enough to fire immediately.
-		lease.arm(p)
-		return lease, nil
+		if pending.err != nil {
+			return nil, pending.err
+		}
+		if pending.lease == nil {
+			return nil, ErrUnavailable
+		}
+		return pending.lease, nil
 	}
 }
 
@@ -745,7 +1024,7 @@ func (p *Pool) connectLease(ctx context.Context, key leaseKey, server Server) (*
 	if err != nil {
 		return nil, err
 	}
-	return &lease{token: randomToken(), server: key.server, root: key.root, session: key.session, configHash: hash, conn: conn, refs: 1}, nil
+	return &lease{token: randomToken(), server: key.server, root: key.root, session: key.session, configHash: hash, conn: conn, pool: p, refs: 1}, nil
 }
 
 func (p *Pool) getLease(token, serverID, root, session string) (*lease, error) {
@@ -764,6 +1043,26 @@ func (p *Pool) getLease(token, serverID, root, session string) (*lease, error) {
 	return l, nil
 }
 
+func (p *Pool) discardBrokenLease(l *lease) {
+	if l == nil {
+		return
+	}
+	p.mu.Lock()
+	current, present := p.leases[l.token]
+	if present && current == l {
+		delete(p.leases, l.token)
+		l.mu.Lock()
+		l.released = true
+		l.pool = p
+		l.mu.Unlock()
+		p.retiring[l] = struct{}{}
+	}
+	p.mu.Unlock()
+	if present && current == l {
+		l.shutdown(true)
+	}
+}
+
 func (p *Pool) Release(token string) error {
 	p.mu.Lock()
 	l, ok := p.leases[token]
@@ -777,7 +1076,9 @@ func (p *Pool) Release(token string) error {
 		// the pool" and "not publishable" the same instant.
 		l.mu.Lock()
 		l.released = true
+		l.pool = p
 		l.mu.Unlock()
+		p.retiring[l] = struct{}{}
 	}
 	p.mu.Unlock()
 	if !ok {
@@ -887,6 +1188,7 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 	}
 	var conn *connection
 	var l *lease
+	callBaseCtx := ctx
 	// Once a stateful connection is owned, expose its control token even if a
 	// later schema check or backend call fails. An unknown outcome must never
 	// force the caller to wait for TTL merely to release its own connection.
@@ -898,9 +1200,13 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 		if l == nil {
 			return
 		}
+		p.mu.Lock()
+		current, present := p.leases[l.token]
 		l.mu.Lock()
-		owned := !l.released
+		conn := l.conn
+		owned := present && current == l && !l.released && conn != nil && conn.Alive()
 		l.mu.Unlock()
+		p.mu.Unlock()
 		if owned {
 			token = l.token
 		}
@@ -926,18 +1232,13 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 		conn = created.conn
 		defer func() { l.done(); l.arm(p) }()
 	} else {
-		// A non-stateful call opens its own short-lived connection, which used to
-		// bypass the closed check entirely: after Pool.Close a tools_call could still
-		// start a backend. This does not leak (the connection is closed when the call
-		// returns) but it contradicts the pool's contract and behaves differently
-		// from the stateful path for the same closed pool.
-		p.mu.Lock()
-		closed := p.closed
-		p.mu.Unlock()
-		if closed {
-			return nil, "", ErrUnavailable
+		transientCtx, operation, err := p.beginTransient(ctx)
+		if err != nil {
+			return nil, "", err
 		}
-		cctx, cancel := context.WithTimeout(ctx, server.Timeout())
+		defer p.endTransient(operation)
+		callBaseCtx = transientCtx
+		cctx, cancel := context.WithTimeout(transientCtx, server.Timeout())
 		defer cancel()
 		fresh, err := connect(cctx, runtime, backendCWD(runtime))
 		if err != nil {
@@ -946,10 +1247,13 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 		conn = fresh
 		defer conn.Close()
 	}
-	callCtx, cancel := context.WithTimeout(ctx, server.Timeout())
+	callCtx, cancel := context.WithTimeout(callBaseCtx, server.Timeout())
 	defer cancel()
 	tools, err := conn.Tools(callCtx)
 	if err != nil {
+		if callCtx.Err() == nil {
+			p.discardBrokenLease(l)
+		}
 		return nil, "", err
 	}
 	var live *mcp.Tool
@@ -980,6 +1284,9 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 	}
 	result, err = conn.CallWithProgress(callCtx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: req.Tool, Arguments: req.Arguments, Meta: meta}}, req.Notify)
 	if err != nil {
+		if callCtx.Err() == nil {
+			p.discardBrokenLease(l)
+		}
 		return nil, "", ErrUnknown
 	}
 	// The deferred block above publishes l.token when the lease is still owned.
@@ -1007,32 +1314,52 @@ func (p *Pool) Call(ctx context.Context, req CallRequest) (result *mcp.CallToolR
 func (p *Pool) Close() {
 	p.mu.Lock()
 	p.closed = true
-	leases := p.leases
+	leases := make([]*lease, 0, len(p.leases)+len(p.retiring))
+	for _, l := range p.leases {
+		leases = append(leases, l)
+	}
+	for l := range p.retiring {
+		leases = append(leases, l)
+	}
 	p.leases = map[string]*lease{}
+	p.retiring = map[*lease]struct{}{}
 	// Mark released inside the same critical section as the drain.
 	for _, l := range leases {
 		l.mu.Lock()
 		l.released = true
+		l.pool = p
 		l.mu.Unlock()
 	}
 	pending := make([]*pendingConnect, 0, len(p.pending))
 	for _, pc := range p.pending {
+		pc.invalidated = true
 		pending = append(pending, pc)
+	}
+	transient := make([]*transientConnect, 0, len(p.transient))
+	for op := range p.transient {
+		transient = append(transient, op)
 	}
 	p.mu.Unlock()
 
-	for _, l := range leases {
-		l.shutdown(true)
-	}
-	// Cancel in-flight connects so their owners stop waiting on a backend that is
-	// about to belong to a closed pool, then wait for them to shut their own
-	// children down. Each owner observes p.closed and closes what it opened.
+	// Cancel connects first; process termination for published leases can take its
+	// full bounded shutdown interval and must not delay pending cancellation.
 	for _, pc := range pending {
 		if pc.cancel != nil {
 			pc.cancel()
 		}
 	}
+	for _, op := range transient {
+		op.cancel()
+	}
+	for _, l := range leases {
+		l.shutdown(true)
+	}
+	// ready only means callers can observe the result. done closes after a late
+	// connection has either been published or fully shut down.
 	for _, pc := range pending {
-		<-pc.ready
+		<-pc.done
+	}
+	for _, op := range transient {
+		<-op.done
 	}
 }

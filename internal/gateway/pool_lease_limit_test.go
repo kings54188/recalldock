@@ -9,16 +9,20 @@ import (
 // start one backend process per root. Grants were already capped at 512 per
 // server; leases had no bound at all. These tests pin reclaim-then-refuse
 // without spawning hundreds of real processes.
-func TestReclaimIdleLeaseLockedDropsReleasedLeases(t *testing.T) {
+func TestReclaimIdleLeasesLockedDropsReleasedLeases(t *testing.T) {
 	p := NewPool(t.TempDir()+"/gw.json", nil)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	for i := 0; i < maxConcurrentLeases; i++ {
 		token := "lease-released-" + itoa(i)
 		p.leases[token] = &lease{token: token, released: true}
 	}
-	if err := p.reclaimIdleLeaseLocked(); err != nil {
+	closing, err := p.reclaimIdleLeasesLocked()
+	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
+	if err != nil {
 		t.Fatalf("reclaim of released leases failed: %v", err)
 	}
 	if len(p.leases) != 0 {
@@ -26,10 +30,9 @@ func TestReclaimIdleLeaseLockedDropsReleasedLeases(t *testing.T) {
 	}
 }
 
-func TestReclaimIdleLeaseLockedRefusesWhenAllReferenced(t *testing.T) {
+func TestReclaimIdleLeasesLockedRefusesWhenAllReferenced(t *testing.T) {
 	p := NewPool(t.TempDir()+"/gw.json", nil)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// Every lease is actively referenced, so none may be dropped: dropping one
 	// would break an in-flight tools_call. The pool must refuse instead.
@@ -37,7 +40,11 @@ func TestReclaimIdleLeaseLockedRefusesWhenAllReferenced(t *testing.T) {
 		token := "lease-busy-" + itoa(i)
 		p.leases[token] = &lease{token: token, refs: 1}
 	}
-	err := p.reclaimIdleLeaseLocked()
+	closing, err := p.reclaimIdleLeasesLocked()
+	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
 	if err == nil {
 		t.Fatal("pool at its bound with all leases referenced did not refuse")
 	}
@@ -49,12 +56,16 @@ func TestReclaimIdleLeaseLockedRefusesWhenAllReferenced(t *testing.T) {
 	}
 }
 
-func TestReclaimIdleLeaseLockedNoopBelowBound(t *testing.T) {
+func TestReclaimIdleLeasesLockedNoopBelowBound(t *testing.T) {
 	p := NewPool(t.TempDir()+"/gw.json", nil)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.leases["lease-one"] = &lease{token: "lease-one", refs: 1}
-	if err := p.reclaimIdleLeaseLocked(); err != nil {
+	closing, err := p.reclaimIdleLeasesLocked()
+	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
+	if err != nil {
 		t.Fatalf("reclaim below bound failed: %v", err)
 	}
 	if len(p.leases) != 1 {

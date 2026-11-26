@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,26 +155,75 @@ func waitForPending(t *testing.T, p *Pool) {
 // publication path and the test would prove nothing.
 func TestCloseDuringConnectDoesNotPublishLease(t *testing.T) {
 	p, server, release := gatedPoolFixture(t)
-	done := make(chan *lease, 1)
+	connected := make(chan *lease, 1)
+	allowPublish := make(chan struct{})
+	cleanup := make(chan *lease, 1)
+	allowCleanup := make(chan struct{})
+	p.testPendingTransition = func(stage string, l *lease) {
+		switch stage {
+		case "connected":
+			connected <- l
+			<-allowPublish
+		case "cleanup":
+			cleanup <- l
+			<-allowCleanup
+		}
+	}
+
+	type acquireResult struct {
+		lease *lease
+		err   error
+	}
+	acquired := make(chan acquireResult, 1)
 	go func() {
-		l, _ := p.acquire(context.Background(), "test", leaseRoot(t), "s", server)
-		done <- l
+		l, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", server)
+		acquired <- acquireResult{lease: l, err: err}
 	}()
 	waitForPending(t, p)
+	release()
+	lateLease := <-connected
 
-	p.Close()
-	release() // let the connect succeed after the pool has closed
-
-	l := <-done
-	if l != nil {
+	closed := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closed)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
 		p.mu.Lock()
-		_, present := p.leases[l.token]
-		n := len(p.leases)
+		isClosed := p.closed
 		p.mu.Unlock()
-		if present {
-			t.Fatalf("a lease whose connect succeeded after Close was published into the closed pool (leases=%d); its backend process would leak", n)
+		if isClosed {
+			break
 		}
-		l.shutdown(true)
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not mark the pool closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowPublish)
+
+	if discarded := <-cleanup; discarded != lateLease {
+		t.Fatal("cleanup did not receive the connected lease")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned when the pending result was visible but its connected backend had not been shut down")
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(allowCleanup)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not wait for pending cleanup to finish")
+	}
+
+	result := <-acquired
+	if result.lease != nil || result.err == nil {
+		t.Fatalf("late connect returned a usable lease after Close: lease=%v err=%v", result.lease, result.err)
+	}
+	if lateLease.conn.Alive() {
+		t.Fatal("Close returned before the late backend process was closed")
 	}
 	p.mu.Lock()
 	remaining := len(p.leases)
@@ -616,8 +664,11 @@ func TestLockOrderStress(t *testing.T) {
 			default:
 			}
 			p.mu.Lock()
-			_ = p.reclaimIdleLeaseLocked()
+			closing, _ := p.reclaimIdleLeasesLocked()
 			p.mu.Unlock()
+			for _, l := range closing {
+				l.shutdown(true)
+			}
 		}
 	}()
 
@@ -782,18 +833,783 @@ func TestOwnerCancellationDoesNotFailHealthyWaiter(t *testing.T) {
 		waiterLease <- l
 		waiterDone <- err
 	}()
-	time.Sleep(30 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		waiters := p.pending[key].waiters
+		p.mu.Unlock()
+		if waiters > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("healthy waiter did not join the pending connect")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	ownerCancel()
-	release() // let the gated backend complete for whoever still wants it
+	release() // let the gated backend complete for the healthy waiter
 
 	oErr := <-ownerDone
 	wErr := <-waiterDone
 	wLease := <-waiterLease
-
-	if oErr != nil && wErr != nil && oErr.Error() == wErr.Error() && !errors.Is(wErr, context.Canceled) {
-		t.Fatalf("healthy waiter received the owner's failure verbatim (%v); a cancelled owner must not fail other callers", wErr)
+	if oErr == nil {
+		t.Fatal("cancelled owner received a lease")
 	}
-	if wLease != nil {
-		wLease.shutdown(true)
+	if wErr != nil || wLease == nil {
+		t.Fatalf("healthy waiter inherited the owner's cancellation: lease=%v err=%v", wLease, wErr)
+	}
+	wLease.done()
+	if err := p.Release(wLease.token); err != nil {
+		t.Fatalf("release waiter lease: %v", err)
+	}
+}
+
+func TestAcquireReplacesStaleSameKeyLeaseWithoutDeadlock(t *testing.T) {
+	p, root, _ := poolFixture(t, true)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	reg, _ := p.registry()
+	old, err := p.acquire(context.Background(), "test", root, "s", reg.Servers["test"])
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	old.done()
+	old.arm(p)
+
+	source := reg.Servers["test"].Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Args = append(runtime.Args, "-test.count=1")
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("rediscover: %v", err)
+	}
+	reg, _ = p.registry()
+
+	type result struct {
+		lease *lease
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		l, err := p.acquire(context.Background(), "test", root, "s", reg.Servers["test"])
+		done <- result{lease: l, err: err}
+	}()
+	var replacement *lease
+	select {
+	case result := <-done:
+		if result.err != nil || result.lease == nil {
+			t.Fatalf("replacement acquire failed: lease=%v err=%v", result.lease, result.err)
+		}
+		replacement = result.lease
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement acquire deadlocked after retiring a stale same-key lease")
+	}
+	if replacement.token == old.token {
+		t.Fatal("stale lease was reused")
+	}
+	if old.conn.Alive() {
+		t.Fatal("unreferenced stale connection remained alive")
+	}
+	replacement.done()
+	if err := p.Release(replacement.token); err != nil {
+		t.Fatalf("release replacement: %v", err)
+	}
+}
+
+func TestAcquireReplacesDeadSameKeyLeaseWithoutDeadlock(t *testing.T) {
+	p, root, _ := poolFixture(t, true)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	reg, _ := p.registry()
+	old, err := p.acquire(context.Background(), "test", root, "s", reg.Servers["test"])
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	old.done()
+	if err := old.conn.Close(); err != nil {
+		t.Fatalf("stop old backend: %v", err)
+	}
+
+	done := make(chan *lease, 1)
+	errs := make(chan error, 1)
+	go func() {
+		l, err := p.acquire(context.Background(), "test", root, "s", reg.Servers["test"])
+		done <- l
+		errs <- err
+	}()
+	var replacement *lease
+	select {
+	case replacement = <-done:
+		if err := <-errs; err != nil || replacement == nil {
+			t.Fatalf("replacement acquire failed: lease=%v err=%v", replacement, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement acquire deadlocked after removing a dead same-key lease")
+	}
+	if replacement.token == old.token {
+		t.Fatal("dead lease was reused")
+	}
+	replacement.done()
+	if err := p.Release(replacement.token); err != nil {
+		t.Fatalf("release replacement: %v", err)
+	}
+}
+
+func TestConfigDriftDoesNotInterruptInFlightTool(t *testing.T) {
+	p, root, marker := poolFixture(t, true)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if _, err := p.Grant("test", GrantOptions{Tool: "echo", ReadOnly: true, Roots: []string{root}}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	req := CallRequest{Server: "test", Tool: "echo", Root: root, Session: "s", Arguments: map[string]any{"message": "before"}}
+	_, token, err := p.Call(context.Background(), req)
+	if err != nil || token == "" {
+		t.Fatalf("initial call: token=%q err=%v", token, err)
+	}
+	p.mu.Lock()
+	old := p.leases[token]
+	p.mu.Unlock()
+
+	req.Lease = token
+	req.Arguments = map[string]any{"message": "wait"}
+	callDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Call(context.Background(), req)
+		callDone <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if body, readErr := os.ReadFile(marker); readErr == nil && len(body) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("controlled backend did not start the in-flight tool")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	reg, _ := p.registry()
+	source := reg.Servers["test"].Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Args = append(runtime.Args, "-test.count=1")
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("rediscover: %v", err)
+	}
+	reg, _ = p.registry()
+	replacement, err := p.acquire(context.Background(), "test", root, "s", reg.Servers["test"])
+	if err != nil {
+		t.Fatalf("acquire replacement: %v", err)
+	}
+	select {
+	case err := <-callDone:
+		if err != nil {
+			t.Fatalf("configuration drift interrupted an in-flight tool: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight tool did not finish")
+	}
+	if old.conn.Alive() {
+		t.Fatal("retired connection remained alive after its in-flight tool finished")
+	}
+	replacement.done()
+	if err := p.Release(replacement.token); err != nil {
+		t.Fatalf("release replacement: %v", err)
+	}
+}
+
+func TestCanceledOwnerDoesNotReceiveConnectedLease(t *testing.T) {
+	p, server, release := gatedPoolFixture(t)
+	connected := make(chan *lease, 1)
+	allowPublish := make(chan struct{})
+	p.testPendingTransition = func(stage string, l *lease) {
+		if stage == "connected" {
+			connected <- l
+			<-allowPublish
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		lease *lease
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		l, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
+		done <- result{lease: l, err: err}
+	}()
+	waitForPending(t, p)
+	release()
+	opened := <-connected
+	cancel()
+	close(allowPublish)
+	outcome := <-done
+	if outcome.lease != nil || outcome.err == nil {
+		t.Fatalf("cancelled owner received a connected lease: lease=%v err=%v", outcome.lease, outcome.err)
+	}
+	if opened.conn.Alive() {
+		t.Fatal("owner cancellation left an unclaimed backend alive")
+	}
+	p.mu.Lock()
+	leases, pending := len(p.leases), len(p.pending)
+	p.mu.Unlock()
+	if leases != 0 || pending != 0 {
+		t.Fatalf("owner cancellation left pool state behind: leases=%d pending=%d", leases, pending)
+	}
+}
+
+func TestRemoveCatalogFailureStillInvalidatesConnectedPendingLease(t *testing.T) {
+	p, server, release := gatedPoolFixture(t)
+	connected := make(chan *lease, 1)
+	allowPublish := make(chan struct{})
+	p.testPendingTransition = func(stage string, l *lease) {
+		if stage == "connected" {
+			connected <- l
+			<-allowPublish
+		}
+	}
+	type acquireResult struct {
+		lease *lease
+		err   error
+	}
+	acquired := make(chan acquireResult, 1)
+	go func() {
+		l, err := p.acquire(context.Background(), "test", leaseRoot(t), "s", server)
+		acquired <- acquireResult{lease: l, err: err}
+	}()
+	waitForPending(t, p)
+	release()
+	opened := <-connected
+	if err := p.Ops.Close(); err != nil {
+		t.Fatalf("close catalog store: %v", err)
+	}
+
+	removed := make(chan error, 1)
+	go func() { removed <- p.Remove("test") }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		generation := p.serverGeneration["test"]
+		p.mu.Unlock()
+		if generation > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Remove did not invalidate the pending connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowPublish)
+	if err := <-removed; err == nil {
+		t.Fatal("Remove unexpectedly succeeded with a closed catalog store")
+	}
+	result := <-acquired
+	if result.lease != nil || result.err == nil {
+		t.Fatalf("pending connection published after Remove: lease=%v err=%v", result.lease, result.err)
+	}
+	if opened.conn.Alive() {
+		t.Fatal("Remove returned before the pending backend was closed")
+	}
+	p.mu.Lock()
+	leases, pending := len(p.leases), len(p.pending)
+	p.mu.Unlock()
+	if leases != 0 || pending != 0 {
+		t.Fatalf("Remove left pool state behind: leases=%d pending=%d", leases, pending)
+	}
+}
+
+func TestCallDoesNotReturnTokenAfterBackendDies(t *testing.T) {
+	p, root, _ := poolFixture(t, true)
+	reg, _ := p.registry()
+	source := reg.Servers["test"].Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Env["RECALLDOCK_GATEWAY_TEST_BACKEND"] = "exit_on_call"
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if _, err := p.Grant("test", GrantOptions{Tool: "echo", ReadOnly: true, Roots: []string{root}}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	_, token, err := p.Call(context.Background(), CallRequest{
+		Server: "test", Tool: "echo", Root: root, Session: "s",
+		Arguments: map[string]any{"message": "exit"},
+	})
+	if err == nil {
+		t.Fatal("backend exit during call was reported as success")
+	}
+	if token != "" {
+		t.Fatalf("Call returned known-dead token %q", token)
+	}
+}
+
+func TestCloseWaitsForConcurrentStatelessCall(t *testing.T) {
+	p, root, marker := poolFixture(t, false)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if _, err := p.Grant("test", GrantOptions{Tool: "echo", ReadOnly: true, Roots: []string{root}}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	callDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Call(context.Background(), CallRequest{
+			Server: "test", Tool: "echo", Root: root, Session: "s",
+			Arguments: map[string]any{"message": "wait"},
+		})
+		callDone <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if body, err := os.ReadFile(marker); err == nil && len(body) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stateless backend did not start its tool")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	p.Close()
+	p.mu.Lock()
+	active := len(p.transient)
+	p.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("Close returned with %d transient calls still active", active)
+	}
+	select {
+	case err := <-callDone:
+		if err == nil {
+			t.Fatal("stateless call unexpectedly succeeded after Close cancelled it")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stateless call outlived Close")
+	}
+}
+
+func TestCloseWaitsForConcurrentDiscover(t *testing.T) {
+	p, _, _ := gatedPoolFixture(t)
+	discoverDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Discover("test")
+		discoverDone <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		active := len(p.transient)
+		p.mu.Unlock()
+		if active > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Discover did not register its transient connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	p.Close()
+	p.mu.Lock()
+	active := len(p.transient)
+	p.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("Close returned with %d discovery connects still active", active)
+	}
+	select {
+	case err := <-discoverDone:
+		if err == nil {
+			t.Fatal("gated Discover unexpectedly succeeded after Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Discover outlived Close")
+	}
+}
+
+func TestOldServerSnapshotCannotRetireNewLease(t *testing.T) {
+	p, root, _ := poolFixture(t, true)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover old config: %v", err)
+	}
+	reg, _ := p.registry()
+	oldServer := reg.Servers["test"]
+	source := oldServer.Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Args = append(runtime.Args, "-test.count=1")
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover new config: %v", err)
+	}
+	reg, _ = p.registry()
+	newLease, err := p.acquire(context.Background(), "test", root, "s", reg.Servers["test"])
+	if err != nil {
+		t.Fatalf("acquire new config: %v", err)
+	}
+
+	if stale, err := p.acquire(context.Background(), "test", root, "s", oldServer); err == nil || stale != nil {
+		t.Fatalf("old server snapshot acquired over the new lease: lease=%v err=%v", stale, err)
+	}
+	p.mu.Lock()
+	current := p.leases[newLease.token]
+	p.mu.Unlock()
+	if current != newLease || !newLease.conn.Alive() {
+		t.Fatal("old server snapshot retired the newer same-key lease")
+	}
+	newLease.done()
+	if err := p.Release(newLease.token); err != nil {
+		t.Fatalf("release new lease: %v", err)
+	}
+}
+
+func TestRetiringLeaseCountsAgainstProcessCapacity(t *testing.T) {
+	p, root, marker := poolFixture(t, true)
+	p.maxLeases = 1
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if _, err := p.Grant("test", GrantOptions{Tool: "echo", ReadOnly: true, Roots: []string{root}}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	req := CallRequest{Server: "test", Tool: "echo", Root: root, Session: "s", Arguments: map[string]any{"message": "before"}}
+	_, token, err := p.Call(context.Background(), req)
+	if err != nil || token == "" {
+		t.Fatalf("initial call: token=%q err=%v", token, err)
+	}
+	req.Lease = token
+	req.Arguments = map[string]any{"message": "wait"}
+	callDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Call(context.Background(), req)
+		callDone <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if body, readErr := os.ReadFile(marker); readErr == nil && len(body) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("old backend did not start its in-flight tool")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	reg, _ := p.registry()
+	source := reg.Servers["test"].Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Args = append(runtime.Args, "-test.count=1")
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, newHash, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newServer := reg.Servers["test"]
+	newServer.ConfigHash = newHash
+	p.mu.Lock()
+	p.serverConfigHash["test"] = newHash
+	p.serverGeneration["test"]++
+	p.mu.Unlock()
+	if lease, err := p.acquire(context.Background(), "test", root, "s", newServer); err == nil || lease != nil || !strings.Contains(err.Error(), "lease_limit") {
+		t.Fatalf("replacement exceeded process capacity while old backend was retiring: lease=%v err=%v", lease, err)
+	}
+	p.mu.Lock()
+	held := len(p.leases) + len(p.pending) + len(p.retiring)
+	p.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("expected one retiring process reservation, got %d", held)
+	}
+
+	if err := <-callDone; err != nil {
+		t.Fatalf("retired in-flight tool failed: %v", err)
+	}
+	newLease, err := p.acquire(context.Background(), "test", root, "s", newServer)
+	if err != nil {
+		t.Fatalf("capacity was not restored after retiring backend exited: %v", err)
+	}
+	newLease.done()
+	if err := p.Release(newLease.token); err != nil {
+		t.Fatalf("release new lease: %v", err)
+	}
+}
+
+func TestConcurrentRemoveCannotLeaveDiscoveredCatalog(t *testing.T) {
+	p, _, release := gatedPoolFixture(t)
+	discoverDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Discover("test")
+		discoverDone <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		active := len(p.transient)
+		p.mu.Unlock()
+		if active > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Discover did not enter its controlled handshake")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- p.Remove("test") }()
+	select {
+	case err := <-removeDone:
+		t.Fatalf("Remove bypassed the in-flight discovery commit: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-discoverDone; err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if err := <-removeDone; err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	catalog, err := p.Ops.LoadCatalog("test")
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	if len(catalog) != 0 {
+		t.Fatalf("Remove returned with %d catalog rows resurrected by Discover", len(catalog))
+	}
+	reg, err := p.registry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := reg.Servers["test"]; exists {
+		t.Fatal("Remove returned with the server restored in the registry")
+	}
+}
+
+func TestLateDiscoverCannotRollbackNewCatalog(t *testing.T) {
+	p, _, release := gatedPoolFixture(t)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Discover("test")
+		firstDone <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		active := len(p.transient)
+		p.mu.Unlock()
+		if active > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first Discover did not enter its controlled handshake")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	reg, _ := p.registry()
+	source := reg.Servers["test"].Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Env["RECALLDOCK_GATEWAY_TEST_BACKEND"] = "schema_v2"
+	delete(runtime.Env, "RECALLDOCK_GATEWAY_TEST_GATE")
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := p.Discover("test")
+		secondDone <- err
+	}()
+	release()
+	if err := <-firstDone; err == nil {
+		t.Fatal("late discovery committed after its source configuration changed")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("new discovery: %v", err)
+	}
+
+	_, currentHash, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, _ = p.registry()
+	if reg.Servers["test"].ConfigHash != currentHash {
+		t.Fatalf("registry hash rolled back: got %q want %q", reg.Servers["test"].ConfigHash, currentHash)
+	}
+	record, err := p.Ops.LoadCatalogTool("test", "echo")
+	if err != nil {
+		t.Fatalf("load echo catalog: %v", err)
+	}
+	if record.ConfigHash != currentHash || !strings.Contains(record.SchemaJSON, "extra_v2") {
+		t.Fatalf("late discovery rolled back the current catalog: hash=%q schema=%s", record.ConfigHash, record.SchemaJSON)
+	}
+}
+
+func TestTransientConnectionsReserveProcessCapacity(t *testing.T) {
+	p, root, marker := poolFixture(t, false)
+	p.maxLeases = 2
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if _, err := p.Grant("test", GrantOptions{Tool: "echo", ReadOnly: true, Roots: []string{root}}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	call := func(done chan<- error) {
+		_, _, err := p.Call(context.Background(), CallRequest{
+			Server: "test", Tool: "echo", Root: root, Session: "s",
+			Arguments: map[string]any{"message": "wait"},
+		})
+		done <- err
+	}
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go call(first)
+	go call(second)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		body, _ := os.ReadFile(marker)
+		if strings.Count(string(body), "started\n") >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("two transient backend calls did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_, _, err := p.Call(context.Background(), CallRequest{
+		Server: "test", Tool: "echo", Root: root, Session: "s",
+		Arguments: map[string]any{"message": "wait"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "lease_limit") {
+		t.Fatalf("third transient backend exceeded the process bound: %v", err)
+	}
+	p.mu.Lock()
+	active := len(p.transient)
+	p.mu.Unlock()
+	if active != 2 {
+		t.Fatalf("expected two transient reservations at the bound, got %d", active)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("first transient call: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second transient call: %v", err)
+	}
+}
+
+func TestOwnerCancellationDuringPublishReleasesInitialReference(t *testing.T) {
+	p, server, release := gatedPoolFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	opened := make(chan *lease, 1)
+	p.testPendingTransition = func(stage string, l *lease) {
+		if stage == "publishing" {
+			opened <- l
+			cancel()
+		}
+	}
+	type result struct {
+		lease *lease
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		l, err := p.acquire(ctx, "test", leaseRoot(t), "s", server)
+		done <- result{lease: l, err: err}
+	}()
+	waitForPending(t, p)
+	release()
+	connected := <-opened
+	outcome := <-done
+	if outcome.lease != nil || outcome.err == nil {
+		t.Fatalf("cancelled owner received a lease: lease=%v err=%v", outcome.lease, outcome.err)
+	}
+	connected.mu.Lock()
+	refs := connected.refs
+	connected.mu.Unlock()
+	if refs != 0 {
+		t.Fatalf("cancelled owner leaked its initial lease reference: refs=%d", refs)
+	}
+	if connected.conn.Alive() {
+		t.Fatal("cancelled owner left an unclaimed backend alive")
+	}
+	p.mu.Lock()
+	leases, retiring := len(p.leases), len(p.retiring)
+	p.mu.Unlock()
+	if leases != 0 || retiring != 0 {
+		t.Fatalf("cancelled owner left capacity reserved: leases=%d retiring=%d", leases, retiring)
+	}
+}
+
+func TestDiscoverUpdateFailureRestoresPreviousCatalog(t *testing.T) {
+	p, _, _ := poolFixture(t, false)
+	if _, _, err := p.Discover("test"); err != nil {
+		t.Fatalf("initial discover: %v", err)
+	}
+	previous, err := p.Ops.LoadCatalogTool("test", "echo")
+	if err != nil {
+		t.Fatalf("load previous catalog: %v", err)
+	}
+	reg, _ := p.registry()
+	source := reg.Servers["test"].Source
+	runtime, _, err := source.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.Env["RECALLDOCK_GATEWAY_TEST_BACKEND"] = "schema_v2"
+	body, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"test": runtime}})
+	if err := os.WriteFile(source.Path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := p.RegistryPath + ".lock"
+	if err := os.WriteFile(lockPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, discoverErr := p.Discover("test")
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if discoverErr == nil {
+		t.Fatal("Discover unexpectedly committed while the registry lock was unavailable")
+	}
+	current, err := p.Ops.LoadCatalogTool("test", "echo")
+	if err != nil {
+		t.Fatalf("previous catalog was deleted after failed refresh: %v", err)
+	}
+	if current.ConfigHash != previous.ConfigHash || current.SchemaJSON != previous.SchemaJSON {
+		t.Fatalf("failed refresh did not restore previous catalog: before=%q after=%q", previous.ConfigHash, current.ConfigHash)
 	}
 }

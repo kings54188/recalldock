@@ -138,8 +138,11 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 
 	// At the bound, a new lease is refused.
 	p.mu.Lock()
-	err := p.reclaimIdleLeaseLocked()
+	closing, err := p.reclaimIdleLeasesLocked()
 	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
 	if err == nil {
 		t.Fatal("pool at its bound with a referenced lease did not refuse")
 	}
@@ -149,9 +152,12 @@ func TestReleasedLeaseFreesCapacity(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 	p.mu.Lock()
-	err = p.reclaimIdleLeaseLocked()
+	closing, err = p.reclaimIdleLeasesLocked()
 	remaining := len(p.leases)
 	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
 	if err != nil {
 		t.Fatalf("capacity was not restored after release: %v", err)
 	}
@@ -166,7 +172,6 @@ func TestReclaimKeepsReferencedLeases(t *testing.T) {
 	p, _, _ := poolFixture(t, false)
 	p.maxLeases = 3
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// One referenced lease and two idle-but-unreleased ones. Reclaim may drop
 	// only the idle ones.
@@ -175,7 +180,12 @@ func TestReclaimKeepsReferencedLeases(t *testing.T) {
 	p.leases["idle-1"] = &lease{token: "idle-1", refs: 0, released: true}
 	p.leases["idle-2"] = &lease{token: "idle-2", refs: 0, released: true}
 
-	if err := p.reclaimIdleLeaseLocked(); err != nil {
+	closing, err := p.reclaimIdleLeasesLocked()
+	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
+	if err != nil {
 		t.Fatalf("reclaim should have succeeded after dropping idle leases: %v", err)
 	}
 	if _, ok := p.leases["busy"]; !ok {
@@ -192,7 +202,6 @@ func TestReclaimToleratesNilConnection(t *testing.T) {
 	p, _, _ := poolFixture(t, false)
 	p.maxLeases = 1
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// refs==0 with a nil conn is exactly the "acquisition failed" shape.
 	p.leases["half"] = &lease{token: "half", refs: 0}
@@ -202,7 +211,12 @@ func TestReclaimToleratesNilConnection(t *testing.T) {
 			t.Fatalf("reclaim panicked on a nil connection: %v", r)
 		}
 	}()
-	if err := p.reclaimIdleLeaseLocked(); err != nil {
+	closing, err := p.reclaimIdleLeasesLocked()
+	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
+	if err != nil {
 		t.Fatalf("reclaim of a half-acquired lease failed: %v", err)
 	}
 	if len(p.leases) != 0 {
@@ -236,8 +250,11 @@ func TestLeaseLimitErrorIsExplainable(t *testing.T) {
 	p.mu.Unlock()
 
 	p.mu.Lock()
-	err := p.reclaimIdleLeaseLocked()
+	closing, err := p.reclaimIdleLeasesLocked()
 	p.mu.Unlock()
+	for _, l := range closing {
+		l.shutdown(true)
+	}
 	if err == nil {
 		t.Fatal("expected a lease_limit refusal")
 	}
